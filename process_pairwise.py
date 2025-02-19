@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 import glob
 from pathlib import Path
 
@@ -34,62 +35,23 @@ from tap import Tap
 # center cropped images
 --image_dir "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward"
 
+CUDA_VISIBLE_DEVICES=0 \
 python process_pairwise.py \
---exp_name "yawzi_nocrop_ss1_window2" \
---image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW" \
---step_size 1 \
---window_size 2 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_nocrop_ss3_window2" \
+--exp_name "yawzi_mast3r_nocrop_ss3_window2" \
 --image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW" \
 --step_size 3 \
 --window_size 2 \
---use_rosbag_raw
+--use_rosbag_raw \
+--use_mast3r
 
-
+CUDA_VISIBLE_DEVICES=1 \
 python process_pairwise.py \
---exp_name "yawzi_nocrop_ss1_window10" \
---image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW" \
---step_size 1 \
---window_size 10 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_nocrop_ss3_window10" \
---image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW" \
---step_size 3 \
---window_size 10 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_midcrop_ss1_window2" \
---image_dir "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward" \
---step_size 1 \
---window_size 2 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_midcrop_ss3_window2" \
+--exp_name "yawzi_mast3r_midcrop_ss3_window2" \
 --image_dir "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward" \
 --step_size 3 \
 --window_size 2 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_midcrop_ss1_window10" \
---image_dir "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward" \
---step_size 1 \
---window_size 2 \
---use_rosbag_raw
-
-python process_pairwise.py \
---exp_name "yawzi_midcrop_ss3_window10" \
---image_dir "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward" \
---step_size 3 \
---window_size 2 \
---use_rosbag_raw
+--use_rosbag_raw \
+--use_mast3r
 '''
 
 
@@ -112,12 +74,12 @@ if __name__ == '__main__':
     lr = 0.01
     niter = 300
 
-    os.makedirs("experiments", exist_ok=True)
     args = ArgParser().parse_args()
 
-    exp_dir = f"experiments/{args.exp_name}"
+    now = datetime.now()
+    today = now.strftime("%m%d%Y")
+    exp_dir = f"experiments/{today}/{args.exp_name}"
     os.makedirs(exp_dir, exist_ok=True)
-
 
     if args.use_7scenes:
         sorted_image_list = sorted([Path(fp).name for fp in glob.glob(f"{args.image_dir}/*color.png")])
@@ -166,24 +128,28 @@ if __name__ == '__main__':
     # process the images in batches
     for batch_idx, start_idx in enumerate(tqdm.tqdm(range(0, len(image_fp_list) - args.window_size + 1, step_size))):
         if args.use_mast3r:
+            assert args.window_size == 2, "MASt3R code currently only supports pairwise processing"
             # approach 1
-            # images = load_images(image_fp_list[idx:idx+2], size=512, verbose=False)
-            # pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
-            # output = inference(pairs, model, device, batch_size=1, verbose=False)
+            images = load_images(image_fp_list[start_idx:start_idx+args.window_size], size=512, verbose=False)
+            pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+            output = inference(pairs, model, device, batch_size=1, verbose=False)
 
-            # scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, min_conf_thr=0.5)
-            # poses = [p.detach().cpu() for p in scene.get_im_poses()]
+            scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False, min_conf_thr=1.0) # default min_conf_thr is 3.0
+            poses = [p.detach().cpu() for p in scene.get_im_poses()]
             # pts3d = scene.get_pts3d()
             # confidence_masks = scene.get_masks()
 
-            # # get relative image poses
-            # if torch.equal(poses[0], torch.eye(4)):
-            #     # camera 1 is the reference
-            #     T_cam1_cam2 = poses[1]
-            # if torch.equal(poses[1], torch.eye(4)):
-            #     # camera 2 is the reference
-            #     T_cam2_cam1 = poses[0]
-            #     T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+            # get relative image poses
+            if torch.equal(poses[0], torch.eye(4)):
+                # camera 1 is the reference
+                T_cam1_cam2 = poses[1]
+            if torch.equal(poses[1], torch.eye(4)):
+                # camera 2 is the reference
+                T_cam2_cam1 = poses[0]
+                T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+
+            if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
+                print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
 
             # approach 2
             # optim_level = "refine"
@@ -207,24 +173,24 @@ if __name__ == '__main__':
             # T_cam1_cam2 = torch.matmul(torch.linalg.inv(mast3r_T_world_cam1), mast3r_T_world_cam2)
 
             # approach 3
-            matches_im0, matches_im1, \
-            pts3d_im0, pts3d_im1, \
-            conf_im0, conf_im1, \
-            desc_conf_im0, desc_conf_im1, \
-            K0, K1 = get_mast3r_output(image_fp_list[idx:idx+2])
+            # matches_im0, matches_im1, \
+            # pts3d_im0, pts3d_im1, \
+            # conf_im0, conf_im1, \
+            # desc_conf_im0, desc_conf_im1, \
+            # K0, K1 = get_mast3r_output(image_fp_list[idx:idx+2])
 
-            # this gives transform to bring object points (image 0 points) in image 1 space I think
-            retval, rvec, tvec = cv2.solvePnP(
-                    objectPoints=pts3d_im0[matches_im0[:, 1], matches_im0[:, 0], :],
-                    imagePoints=matches_im1.astype(np.float32),    # ensure same datatype for opencv
-                    cameraMatrix=K1,
-                    distCoeffs=np.zeros((0,)),
-                    flags=cv2.SOLVEPNP_EPNP
-            )
-            R = cv2.Rodrigues(rvec)[0]  # world to cam
-            pose = inv(np.r_[np.c_[R, tvec], [(0, 0, 0, 1)]])  # cam to world
-            T_cam2_cam1 = torch.from_numpy(pose.astype(np.float32))
-            T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+            # # this gives transform to bring object points (image 0 points) in image 1 space I think
+            # retval, rvec, tvec = cv2.solvePnP(
+            #         objectPoints=pts3d_im0[matches_im0[:, 1], matches_im0[:, 0], :],
+            #         imagePoints=matches_im1.astype(np.float32),    # ensure same datatype for opencv
+            #         cameraMatrix=K1,
+            #         distCoeffs=np.zeros((0,)),
+            #         flags=cv2.SOLVEPNP_EPNP
+            # )
+            # R = cv2.Rodrigues(rvec)[0]  # world to cam
+            # pose = inv(np.r_[np.c_[R, tvec], [(0, 0, 0, 1)]])  # cam to world
+            # T_cam2_cam1 = torch.from_numpy(pose.astype(np.float32))
+            # T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
         else:
             if args.window_size == 1:
                 images = load_images(image_fp_list, size=512, verbose=False, crop=center_crop if args.crop_middle else None)
@@ -236,7 +202,7 @@ if __name__ == '__main__':
             output = inference(pairs, model, device, batch_size=1, verbose=False)
 
             if args.window_size == 2:
-                scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False)
+                scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False) # min_conf_thr=2  or whatever if you wanted to play with it
             else:
                 scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer, verbose=False)
                 loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
@@ -258,6 +224,8 @@ if __name__ == '__main__':
                     # camera 2 is the reference
                     T_cam2_cam1 = poses[0]
                     T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+                if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
+                    print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
             else:
                 # poses are all T_world_cam but we want relative poses from the last cam
                 T_world_lastcam = torch.eye(4)

@@ -132,7 +132,6 @@ def sparse_global_alignment(imgs, pairs_in, cache_path, model, subsample=8, desc
     pairs, cache_path = forward_mast3r(pairs_in, model,
                                        cache_path=cache_path, subsample=subsample,
                                        desc_conf=desc_conf, device=device)
-
     # extract canonical pointmaps
     tmp_pairs, pairwise_scores, canonical_views, canonical_paths, preds_21 = \
         prepare_canonical_data(imgs, pairs, subsample, cache_path=cache_path, mode='avg-angle', device=device)
@@ -166,7 +165,7 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
                            shared_intrinsics=False,
                            init={}, device='cuda', dtype=torch.float32,
                            matching_conf_thr=5., loss_dust3r_w=0.01,
-                           verbose=True, dbg=()):
+                           verbose=False, dbg=()):
     init = copy.deepcopy(init)
     # extrinsic parameters
     vec0001 = torch.tensor((0, 0, 0, 1), dtype=dtype, device=device)
@@ -284,10 +283,11 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
 
     K = make_K_cam_depth(log_focals, pps, None, None, None, None)
 
-    if shared_intrinsics:
-        print('init focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
-    else:
-        print('init focals =', to_numpy(K[:, 0, 0]))
+    if verbose:
+        if shared_intrinsics:
+            print('init focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
+        else:
+            print('init focals =', to_numpy(K[:, 0, 0]))
 
     # spectral low-rank projection of depthmaps
     if lora_depth:
@@ -396,34 +396,38 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         optimizer = torch.optim.Adam(params, lr=1, weight_decay=0, betas=(0.9, 0.9))
         ploss = pix_loss if 'meta' in repr(pix_loss) else (lambda a: pix_loss)
 
-        with tqdm(total=niter) as bar:
-            for iter in range(niter or 1):
-                K, (w2cam, cam2w), depthmaps = make_K_cam_depth(log_focals, pps, trans, quats, log_sizes, core_depth)
-                pts3d = make_pts3d(anchors, K, cam2w, depthmaps, base_focals=base_focals)
-                if niter == 0:
-                    break
+        if verbose:
+            bar =  tqdm(total=niter)
+        for iter in range(niter or 1):
+            K, (w2cam, cam2w), depthmaps = make_K_cam_depth(log_focals, pps, trans, quats, log_sizes, core_depth)
+            pts3d = make_pts3d(anchors, K, cam2w, depthmaps, base_focals=base_focals)
+            if niter == 0:
+                break
 
-                alpha = (iter / niter)
-                lr = schedule(alpha, lr_base, lr_end)
-                adjust_learning_rate_by_lr(optimizer, lr)
-                pix_loss = ploss(1 - alpha)
-                optimizer.zero_grad()
-                loss = loss_func(K, w2cam, pts3d, pix_loss) + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
-                loss.backward()
-                optimizer.step()
+            alpha = (iter / niter)
+            lr = schedule(alpha, lr_base, lr_end)
+            adjust_learning_rate_by_lr(optimizer, lr)
+            pix_loss = ploss(1 - alpha)
+            optimizer.zero_grad()
+            loss = loss_func(K, w2cam, pts3d, pix_loss) + loss_dust3r_w * loss_dust3r(cam2w, pts3d, lossd)
+            loss.backward()
+            optimizer.step()
 
-                # make sure the pose remains well optimizable
-                for i in range(len(imgs)):
-                    quats[i].data[:] /= quats[i].data.norm()
+            # make sure the pose remains well optimizable
+            for i in range(len(imgs)):
+                quats[i].data[:] /= quats[i].data.norm()
 
-                loss = float(loss)
-                if loss != loss:
-                    break  # NaN loss
+            loss = float(loss)
+            if loss != loss:
+                break  # NaN loss
+
+            if verbose:
                 bar.set_postfix_str(f'{lr=:.4f}, {loss=:.3f}')
                 bar.update(1)
 
         if niter:
-            print(f'>> final loss = {loss}')
+            if verbose:
+                print(f'>> final loss = {loss}\n')
         return dict(intrinsics=K.detach(), cam2w=cam2w.detach(),
                     depthmaps=[d.detach() for d in depthmaps], pts3d=[p.detach() for p in pts3d])
 
@@ -453,10 +457,11 @@ def sparse_scene_optimizer(imgs, subsample, imsizes, pps, base_focals, core_dept
         res_fine = optimize_loop(loss_2d, lr_base=lr2, niter=niter2, pix_loss=loss2)
 
     K = make_K_cam_depth(log_focals, pps, None, None, None, None)
-    if shared_intrinsics:
-        print('Final focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
-    else:
-        print('Final focals =', to_numpy(K[:, 0, 0]))
+    if verbose:
+        if shared_intrinsics:
+            print('Final focal (shared) = ', to_numpy(K[0, 0, 0]).round(2))
+        else:
+            print('Final focals =', to_numpy(K[:, 0, 0]))
 
     return imgs, res_coarse, res_fine
 
@@ -526,7 +531,7 @@ def forward_mast3r(pairs, model, cache_path, desc_conf='desc_conf',
                    device='cuda', subsample=8, **matching_kw):
     res_paths = {}
 
-    for img1, img2 in tqdm(pairs):
+    for img1, img2 in pairs:
         idx1 = hash_md5(img1['instance'])
         idx2 = hash_md5(img2['instance'])
 
@@ -638,7 +643,7 @@ def prepare_canonical_data(imgs, tmp_pairs, subsample, order_imgs=False, min_con
     canonical_paths = []
     preds_21 = {}
 
-    for img in tqdm(imgs):
+    for img in imgs:
         if cache_path:
             cache = os.path.join(cache_path, 'canon_views', hash_md5(img) + f'_{subsample=}_{kw=}.pth')
             canonical_paths.append(cache)
@@ -964,7 +969,7 @@ def spectral_projection_of_depthmaps(imgs, intrinsics, depthmaps, subsample, cac
     core_depth = []
     lora_proj = []
 
-    for i, img in enumerate(tqdm(imgs)):
+    for i, img in enumerate(imgs):
         cache = os.path.join(cache_path, 'lora_depth', hash_md5(img)) if cache_path else None
         depth, proj = spectral_projection_depth(intrinsics[i], depthmaps[i], subsample,
                                                 cache_path=cache, **kw)
