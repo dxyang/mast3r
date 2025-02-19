@@ -1,9 +1,12 @@
+import csv
 import os
 import glob
 from pathlib import Path
-
+from scipy.spatial.transform import Rotation as R
 import numpy as np
 import torch
+
+
 
 from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points, plot_points_sequence
 
@@ -19,7 +22,6 @@ class ArgParser(Tap):
 
 if __name__ == '__main__':
     device = 'cuda'
-    os.makedirs("experiments", exist_ok=True)
     args = ArgParser().parse_args()
 
     exp_dir = f"experiments/{args.exp_name}"
@@ -31,7 +33,7 @@ if __name__ == '__main__':
         xmin, xmax = -60, 60
         ymin, ymax = -60, 60
         zmin, zmax = -60, 60
-    elif '7scenes' or 'test' in args.exp_name:
+    elif '7scenes' in args.exp_name or 'test' in args.exp_name:
         xmin, xmax = -2, 2
         ymin, ymax = -2, 2
         zmin, zmax = -2, 2
@@ -99,3 +101,41 @@ if __name__ == '__main__':
 
     if "7scenes" in args.exp_name:
         gt_pcd_scene.plot_scene_to_html(f"{exp_dir}/gt_poses")
+
+
+    # export poses to csv format
+    # timestamp x y z qx qy qz qw
+    # HACK: assume what the original image directories are and copypasta logic from process_pairwise.py
+    assert 'yawzi' in args.exp_name
+    if 'midcrop' in args.exp_name:
+        image_dir = "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward"
+    elif 'nocrop' in args.exp_name:
+        image_dir = "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW"
+    else:
+        raise ValueError("invalid exp_name")
+
+    sorted_image_list = sorted([Path(fp).name for fp in glob.glob(f"{image_dir}/*.png")])
+    assert 'ss3' in args.exp_name
+    assert 'window2' in args.exp_name
+    sorted_image_list = sorted_image_list[::3]
+    assert len(sorted_image_list) == len(T_world_cams)
+
+    # convert each T_world_cam into a row of the csv
+    csv_rows = []
+    for idx, (T_world_cam, image_fp) in enumerate(zip(T_world_cams, sorted_image_list)):
+        T_world_cam = T_world_cam.cpu().numpy()
+        timestamp = image_fp.split('.')[0]
+        ts_s, ts_ns = float(timestamp.split('-')[0]), float(timestamp.split('-')[1]) / 1e9
+        combined_ts = ts_s + ts_ns
+        combined_ts_string = "{:.9f}".format(combined_ts)
+
+        tx, ty, tz = T_world_cam[:3, 3]
+        rotation = R.from_matrix(T_world_cam[:3, :3])
+        qx, qy, qz, qw = rotation.as_quat()
+
+        csv_rows.append([combined_ts_string, tx, ty, tz, qx, qy, qz, qw])
+
+    csv_fp = f"{exp_dir}/poses.csv"
+    with open(csv_fp, 'w') as f:
+        writer = csv.writer(f)
+        writer.writerows(csv_rows)
