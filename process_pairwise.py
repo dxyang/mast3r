@@ -56,7 +56,6 @@ python process_pairwise.py \
 
 
 class ArgParser(Tap):
-    use_mast3r: bool = False
     exp_name: str
     image_dir: str = os.path.expanduser("~/localdata/usvi_nov_2024/yawzi/rectified_imgs_with_caminfo")
     crop_middle: bool = False # take the middle 1024x768 or 2048x1536 instead of the full 1920x1080 or 3840x2160 image
@@ -64,6 +63,11 @@ class ArgParser(Tap):
     num_images: int = 0
 
     window_size: int = 2
+
+    use_mast3r: bool = False
+    mast3r_v1: bool = False
+    mast3r_v2: bool = False
+    mast3r_v3: bool = False
 
     use_rosbag_raw: bool = False
     use_7scenes: bool = False
@@ -129,68 +133,74 @@ if __name__ == '__main__':
     for batch_idx, start_idx in enumerate(tqdm.tqdm(range(0, len(image_fp_list) - args.window_size + 1, step_size))):
         if args.use_mast3r:
             assert args.window_size == 2, "MASt3R code currently only supports pairwise processing"
+
             # approach 1
-            images = load_images(image_fp_list[start_idx:start_idx+args.window_size], size=512, verbose=False)
-            pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
-            output = inference(pairs, model, device, batch_size=1, verbose=False)
+            if args.mast3r_v1:
+                images = load_images(image_fp_list[start_idx:start_idx+args.window_size], size=512, verbose=False)
+                pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+                output = inference(pairs, model, device, batch_size=1, verbose=False)
 
-            scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False, min_conf_thr=1.0) # default min_conf_thr is 3.0
-            poses = [p.detach().cpu() for p in scene.get_im_poses()]
-            # pts3d = scene.get_pts3d()
-            # confidence_masks = scene.get_masks()
+                scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False, min_conf_thr=1.0) # default min_conf_thr is 3.0
+                poses = [p.detach().cpu() for p in scene.get_im_poses()]
+                # pts3d = scene.get_pts3d()
+                # confidence_masks = scene.get_masks()
 
-            # get relative image poses
-            if torch.equal(poses[0], torch.eye(4)):
-                # camera 1 is the reference
-                T_cam1_cam2 = poses[1]
-            if torch.equal(poses[1], torch.eye(4)):
-                # camera 2 is the reference
-                T_cam2_cam1 = poses[0]
-                T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+                # get relative image poses
+                if torch.equal(poses[0], torch.eye(4)):
+                    # camera 1 is the reference
+                    T_cam1_cam2 = poses[1]
+                if torch.equal(poses[1], torch.eye(4)):
+                    # camera 2 is the reference
+                    T_cam2_cam1 = poses[0]
+                    T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
 
-            if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
-                print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
+                if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
+                    print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
 
             # approach 2
-            # optim_level = "refine"
-            # lr1, lr2 = 0.07, 0.014
-            # niter1, niter2 = 200, 80 #500, 200
-            # matching_conf_thr = 5.0
-            # shared_intrinsics = True
-            # verbose = False
+            elif args.mast3r_v2:
+                optim_level = "refine"
+                lr1, lr2 = 0.07, 0.014
+                niter1, niter2 = 200, 80 #500, 200
+                matching_conf_thr = 5.0
+                shared_intrinsics = True
+                verbose = False
 
-            # scene = sparse_global_alignment(image_fp_list[idx:idx+2], pairs, "/tmp/mast3r",
-            #     model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
-            #     opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
-            #     matching_conf_thr=matching_conf_thr, verbose=verbose
-            # )
+                scene = sparse_global_alignment(image_fp_list[idx:idx+2], pairs, "/tmp/mast3r",
+                    model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
+                    opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
+                    matching_conf_thr=matching_conf_thr, verbose=verbose
+                )
 
-            # poses = [p.detach().cpu() for p in scene.get_im_poses()]
+                poses = [p.detach().cpu() for p in scene.get_im_poses()]
 
-            # mast3r_T_world_cam1 = poses[0]
-            # mast3r_T_world_cam2 = poses[1]
+                mast3r_T_world_cam1 = poses[0]
+                mast3r_T_world_cam2 = poses[1]
 
-            # T_cam1_cam2 = torch.matmul(torch.linalg.inv(mast3r_T_world_cam1), mast3r_T_world_cam2)
+                T_cam1_cam2 = torch.matmul(torch.linalg.inv(mast3r_T_world_cam1), mast3r_T_world_cam2)
 
             # approach 3
-            # matches_im0, matches_im1, \
-            # pts3d_im0, pts3d_im1, \
-            # conf_im0, conf_im1, \
-            # desc_conf_im0, desc_conf_im1, \
-            # K0, K1 = get_mast3r_output(image_fp_list[idx:idx+2])
+            elif args.mast3r_v3:
+                matches_im0, matches_im1, \
+                pts3d_im0, pts3d_im1, \
+                conf_im0, conf_im1, \
+                desc_conf_im0, desc_conf_im1, \
+                K0, K1 = get_mast3r_output(image_fp_list[idx:idx+2])
 
-            # # this gives transform to bring object points (image 0 points) in image 1 space I think
-            # retval, rvec, tvec = cv2.solvePnP(
-            #         objectPoints=pts3d_im0[matches_im0[:, 1], matches_im0[:, 0], :],
-            #         imagePoints=matches_im1.astype(np.float32),    # ensure same datatype for opencv
-            #         cameraMatrix=K1,
-            #         distCoeffs=np.zeros((0,)),
-            #         flags=cv2.SOLVEPNP_EPNP
-            # )
-            # R = cv2.Rodrigues(rvec)[0]  # world to cam
-            # pose = inv(np.r_[np.c_[R, tvec], [(0, 0, 0, 1)]])  # cam to world
-            # T_cam2_cam1 = torch.from_numpy(pose.astype(np.float32))
-            # T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+                # this gives transform to bring object points (image 0 points) in image 1 space I think
+                retval, rvec, tvec = cv2.solvePnP(
+                        objectPoints=pts3d_im0[matches_im0[:, 1], matches_im0[:, 0], :],
+                        imagePoints=matches_im1.astype(np.float32),    # ensure same datatype for opencv
+                        cameraMatrix=K1,
+                        distCoeffs=np.zeros((0,)),
+                        flags=cv2.SOLVEPNP_EPNP
+                )
+                R = cv2.Rodrigues(rvec)[0]  # world to cam
+                pose = inv(np.r_[np.c_[R, tvec], [(0, 0, 0, 1)]])  # cam to world
+                T_cam2_cam1 = torch.from_numpy(pose.astype(np.float32))
+                T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+            else:
+                assert False
         else:
             if args.window_size == 1:
                 images = load_images(image_fp_list, size=512, verbose=False, crop=center_crop if args.crop_middle else None)
