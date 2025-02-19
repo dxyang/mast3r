@@ -166,7 +166,7 @@ if __name__ == '__main__':
                 shared_intrinsics = True
                 verbose = False
 
-                scene = sparse_global_alignment(image_fp_list[idx:idx+2], pairs, "/tmp/mast3r",
+                scene = sparse_global_alignment(image_fp_list[start_idx:start_idx+args.window_size], pairs, "/tmp/mast3r",
                     model, lr1=lr1, niter1=niter1, lr2=lr2, niter2=niter2, device=device,
                     opt_depth='depth' in optim_level, shared_intrinsics=shared_intrinsics,
                     matching_conf_thr=matching_conf_thr, verbose=verbose
@@ -185,7 +185,7 @@ if __name__ == '__main__':
                 pts3d_im0, pts3d_im1, \
                 conf_im0, conf_im1, \
                 desc_conf_im0, desc_conf_im1, \
-                K0, K1 = get_mast3r_output(image_fp_list[idx:idx+2])
+                K0, K1 = get_mast3r_output(image_fp_list[start_idx:start_idx+args.window_size])
 
                 # this gives transform to bring object points (image 0 points) in image 1 space I think
                 retval, rvec, tvec = cv2.solvePnP(
