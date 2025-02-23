@@ -12,10 +12,15 @@ from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points, plo
 
 from tap import Tap
 
+from utils.pointmaps import transform_pointmap
+
 class ArgParser(Tap):
     exp_name: str
     subsample: int = 1
     plot_transforms: bool = False
+
+    export_pose_csv: bool = False
+    plot_pointmap_scene: bool = False
 
     #
     seven_scenes_dir: str = os.path.expanduser("~/localdata/7scenes")
@@ -51,6 +56,9 @@ if __name__ == '__main__':
     gt_pcd_scene = PlotlyScene(
         size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
     )
+    dust3r_scene = PlotlyScene(
+        size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
+    )
 
     if "7scenes" in args.exp_name:
         # try to read in the ground truth data and plot over top
@@ -64,10 +72,6 @@ if __name__ == '__main__':
             dset_subset = "heads"
         else:
             assert False
-
-        # python process_pairwise.py --exp_name 7scenes_stairs_seq01 --use_7scenes --image_dir /home/dayang/localdata/7scenes/stairs/seq-01
-        # python process_pairwise.py --exp_name 7scenes_office_seq01 --use_7scenes --image_dir /home/dayang/localdata/7scenes/office/seq-01
-        # python process_pairwise.py --exp_name 7scenes_heads_seq01 --use_7scenes --image_dir /home/dayang/localdata/7scenes/heads/seq-01
 
         if "seq01" in args.exp_name:
             dset_subset += "/seq-01"
@@ -87,7 +91,7 @@ if __name__ == '__main__':
 
     for idx, T_world_cam in enumerate(T_world_cams[::args.subsample]):
         if args.plot_transforms:
-            plot_transform(tf_scene.figure, T_world_cam.cpu().numpy(), label=f"image_{idx}", linelength=0.1, linewidth=5)
+            plot_transform(tf_scene.figure, T_world_cam.cpu().numpy(), label=f"image_{idx}", linelength=0.5, linewidth=10)
 
         pcd_xyz.append(T_world_cam[:3, 3])
 
@@ -102,40 +106,62 @@ if __name__ == '__main__':
     if "7scenes" in args.exp_name:
         gt_pcd_scene.plot_scene_to_html(f"{exp_dir}/gt_poses")
 
+    if args.plot_pointmap_scene:
+        # plot the pointmap scene
+        pointmap_subsample = 200
 
-    # export poses to csv format
-    # timestamp x y z qx qy qz qw
-    # HACK: assume what the original image directories are and copypasta logic from process_pairwise.py
-    assert 'yawzi' in args.exp_name
-    if 'midcrop' in args.exp_name:
-        image_dir = "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward"
-    elif 'nocrop' in args.exp_name:
-        image_dir = "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW"
-    else:
-        raise ValueError("invalid exp_name")
+        # load imgs and pointmaps
+        saved_imgs = np.load(f"{exp_dir}/imgs.npy")
+        saved_pointmaps = np.load(f"{exp_dir}/pointmaps.npy")
 
-    sorted_image_list = sorted([Path(fp).name for fp in glob.glob(f"{image_dir}/*.png")])
-    assert 'ss3' in args.exp_name
-    assert 'window2' in args.exp_name
-    sorted_image_list = sorted_image_list[::3]
-    assert len(sorted_image_list) == len(T_world_cams)
+        colors = []
+        for viz_img in saved_imgs:
+            flattened = viz_img.reshape(-1, 3)
+            img_color = [f"rgb({r},{g},{b})" for r,g,b in flattened]
+            colors.append(img_color)
 
-    # convert each T_world_cam into a row of the csv
-    csv_rows = []
-    for idx, (T_world_cam, image_fp) in enumerate(zip(T_world_cams, sorted_image_list)):
-        T_world_cam = T_world_cam.cpu().numpy()
-        timestamp = image_fp.split('.')[0]
-        ts_s, ts_ns = float(timestamp.split('-')[0]), float(timestamp.split('-')[1]) / 1e9
-        combined_ts = ts_s + ts_ns
-        combined_ts_string = "{:.9f}".format(combined_ts)
+        for i in range(len(T_world_cams)):
+            if i % 2 == 0:
+                plot_transform(dust3r_scene.figure, T_world_cams[i].cpu().numpy(), label=f'cam_{i}', linelength=0.1, linewidth=5)
+                plot_points(dust3r_scene.figure, saved_pointmaps[i].reshape(-1, 3)[::pointmap_subsample].T, size=1, name=f'pointmap_{i}', color=colors[i][::pointmap_subsample])
 
-        tx, ty, tz = T_world_cam[:3, 3]
-        rotation = R.from_matrix(T_world_cam[:3, :3])
-        qx, qy, qz, qw = rotation.as_quat()
+        dust3r_scene.plot_scene_to_html(f"{exp_dir}/dust3r_scene")
 
-        csv_rows.append([combined_ts_string, tx, ty, tz, qx, qy, qz, qw])
+    if args.export_pose_csv:
+        # export poses to csv format
+        # timestamp x y z qx qy qz qw
+        # HACK: assume what the original image directories are and copypasta logic from process_pairwise.py
+        assert 'yawzi' in args.exp_name
+        if 'midcrop' in args.exp_name:
+            image_dir = "/srv/warplab/dxy/gopro_slam/2024_11_USVI/2024_11_14_yawzi/raw_downward"
+        elif 'nocrop' in args.exp_name:
+            image_dir = "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW"
+        else:
+            raise ValueError("invalid exp_name")
 
-    csv_fp = f"{exp_dir}/poses.csv"
-    with open(csv_fp, 'w') as f:
-        writer = csv.writer(f)
-        writer.writerows(csv_rows)
+        sorted_image_list = sorted([Path(fp).name for fp in glob.glob(f"{image_dir}/*.png")])
+        assert 'ss3' in args.exp_name
+        assert 'window2' in args.exp_name
+        sorted_image_list = sorted_image_list[::3]
+        assert len(sorted_image_list) == len(T_world_cams)
+
+        # convert each T_world_cam into a row of the csv
+        csv_rows = []
+        csv_rows.append(["timestamp", "x", "y", "z", "qx", "qy", "qz", "qw"])
+        for idx, (T_world_cam, image_fp) in enumerate(zip(T_world_cams, sorted_image_list)):
+            T_world_cam = T_world_cam.cpu().numpy()
+            timestamp = image_fp.split('.')[0]
+            ts_s, ts_ns = float(timestamp.split('-')[0]), float(timestamp.split('-')[1]) / 1e9
+            combined_ts = ts_s + ts_ns
+            combined_ts_string = "{:.9f}".format(combined_ts)
+
+            tx, ty, tz = T_world_cam[:3, 3]
+            rotation = R.from_matrix(T_world_cam[:3, :3])
+            qx, qy, qz, qw = rotation.as_quat()
+
+            csv_rows.append([combined_ts_string, tx, ty, tz, qx, qy, qz, qw])
+
+        csv_fp = f"{exp_dir}/poses.csv"
+        with open(csv_fp, 'w') as f:
+            writer = csv.writer(f)
+            writer.writerows(csv_rows)
