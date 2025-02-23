@@ -28,6 +28,8 @@ from mast3r_helpers import get_mast3r_output, scale_intrinsics
 
 from tap import Tap
 
+from utils.pointmaps import transform_pointmap
+
 '''
 # original images
 --image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW"
@@ -64,6 +66,11 @@ class ArgParser(Tap):
 
     window_size: int = 2
 
+    adjust_min_conf: bool = False   # in the pair viewer, adjust min_conf_thr based on the number of inliers
+
+    save_imgs: bool = False
+    save_pts: bool = False
+
     use_mast3r: bool = False
     mast3r_v1: bool = False
     mast3r_v2: bool = False
@@ -71,6 +78,8 @@ class ArgParser(Tap):
 
     use_rosbag_raw: bool = False
     use_7scenes: bool = False
+
+    use_preset_pose_csv: str = None
 
 if __name__ == '__main__':
     device = 'cuda'
@@ -108,9 +117,6 @@ if __name__ == '__main__':
         model_name = os.path.expanduser("~/code/mast3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
         model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(device)
 
-    T_world_cam1 = torch.eye(4)
-    T_world_cams = [T_world_cam1.unsqueeze(0)]
-
     if args.window_size == 1:
         num_batches = 1
         step_size = len(image_fp_list)
@@ -128,6 +134,13 @@ if __name__ == '__main__':
             center_crop = (1536, 2048)
         else:
             raise ValueError(f"image is not 1920x1080 or 3840x2160")
+
+    # desired outputs
+    T_world_cam1 = torch.eye(4)
+    T_world_cams = [T_world_cam1.unsqueeze(0)]
+    save_intrinsics = []
+    save_imgs = []
+    save_pointmaps = []
 
     # process the images in batches
     for batch_idx, start_idx in enumerate(tqdm.tqdm(range(0, len(image_fp_list) - args.window_size + 1, step_size))):
@@ -212,28 +225,53 @@ if __name__ == '__main__':
             output = inference(pairs, model, device, batch_size=1, verbose=False)
 
             if args.window_size == 2:
-                scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False) # min_conf_thr=2  or whatever if you wanted to play with it
+                scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False, adjust_min_conf=args.adjust_min_conf) # min_conf_thr=2  or whatever if you wanted to play with it
             else:
                 scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer, verbose=False)
                 loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
 
             # retrieve useful values from scene:
-            # imgs = scene.imgs
-            # focals = scene.get_focals()
+            imgs = scene.imgs
+            intrinsics = [k.cpu().numpy() for k in scene.get_intrinsics()]
             poses = [p.detach().cpu() for p in scene.get_im_poses()]
-            # TODO: figure out how to use the 3d points and get them all in the same frame to post process plot
-            # pts3d = scene.get_pts3d()
+            pts3d = [pts3d.cpu() for pts3d in scene.get_pts3d()]
             # confidence_masks = scene.get_masks()
 
             if args.window_size == 2:
                 # get relative image poses
-                if torch.equal(poses[0], torch.eye(4)):
+                # if torch.equal(poses[0], torch.eye(4)):
+                if scene.ref_is_cam1:
                     # camera 1 is the reference
                     T_cam1_cam2 = poses[1]
-                if torch.equal(poses[1], torch.eye(4)):
+                    pointmap1_wrt_cam1 = pts3d[0]
+                    pointmap2_wrt_cam1 = pts3d[1]
+                # if torch.equal(poses[1], torch.eye(4)):
+                if not scene.ref_is_cam1:
                     # camera 2 is the reference
                     T_cam2_cam1 = poses[0]
                     T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+
+                    pointmap1_wrt_cam2 = pts3d[0] # W x H x 3
+                    pointmap2_wrt_cam2 = pts3d[1]
+
+                    pointmap1_wrt_cam1 = transform_pointmap(pointmap1_wrt_cam2, T_cam1_cam2)
+                    pointmap2_wrt_cam1 = transform_pointmap(pointmap1_wrt_cam2, T_cam1_cam2)
+
+                    # pcd1_wrt_cam2 = pointmap1_wrt_cam2.view(-1, 3) # N x 3
+                    # pcd2_wrt_cam2 = pointmap2_wrt_cam2.view(-1, 3)
+
+                    # hpcd1_wrt_cam2 = torch.cat([pcd1_wrt_cam2, torch.ones(pcd1_wrt_cam2.shape[0], 1)], dim=1) # N x 4
+                    # hpcd2_wrt_cam2 = torch.cat([pcd2_wrt_cam2, torch.ones(pcd2_wrt_cam2.shape[0], 1)], dim=1)
+
+                    # hpcd1_wrt_cam1 = torch.matmul(T_cam2_cam1, hpcd1_wrt_cam2.T).T # N x 4
+                    # hpcd2_wrt_cam1 = torch.matmul(T_cam2_cam1, hpcd2_wrt_cam2.T).T
+
+                    # pcd1_wrt_cam1 = hpcd1_wrt_cam1[:, :3]
+                    # pcd2_wrt_cam1 = hpcd2_wrt_cam1[:, :3]
+
+                    # pointmap1_wrt_cam1 = pcd1_wrt_cam1.reshape(pointmap1_wrt_cam2.shape)
+                    # pointmap2_wrt_cam1 = pcd2_wrt_cam1.reshape(pointmap2_wrt_cam2.shape)
+
                 if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
                     print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
             else:
@@ -250,9 +288,60 @@ if __name__ == '__main__':
             T_world_cam2 = torch.matmul(T_world_cam1, T_cam1_cam2)
             T_world_cams.append(T_world_cam2.unsqueeze(0))
 
+            # saving images so have color for pointclouds
+            if args.save_imgs:
+                assert not args.use_mast3r
+                # save imgs as uint8 instead of float32
+                if batch_idx == 0:
+                    save_imgs.append((imgs[0] * 255.).astype(np.uint8))
+                save_imgs.append((imgs[1] * 255.).astype(np.uint8))
+
+            # saving pointmaps to become pointclouds easily
+            if args.save_pts:
+                assert not args.use_mast3r
+
+                # need to convert pointmaps to world frame
+                if batch_idx == 0:
+                    pointmap1_wrt_world = transform_pointmap(pointmap1_wrt_cam1, T_world_cam1)
+                    save_pointmaps.append(pointmap1_wrt_world.numpy())
+                pointmap2_wrt_world = transform_pointmap(pointmap2_wrt_cam1, T_world_cam1)
+                save_pointmaps.append(pointmap2_wrt_world.numpy())
+
+            if batch_idx == 0:
+                save_intrinsics.append(intrinsics[0])
+            save_intrinsics.append(intrinsics[1])
+
+            # debug the scene here
+            dxy_dbg = False
+            if dxy_dbg and batch_idx == 300:
+                from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points
+                xmin, xmax = -6, 6
+                ymin, ymax = -6, 6
+                zmin, zmax = -5, 5
+                dust3r_scene = PlotlyScene(
+                    size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
+                )
+                pointmap_subsample = 100
+
+                colors = []
+                for viz_img in save_imgs:
+                    flattened = viz_img.reshape(-1, 3)
+                    img_color = [f"rgb({r},{g},{b})" for r,g,b in flattened]
+                    colors.append(img_color)
+
+                for i in range(len(T_world_cams)):
+                    plot_transform(dust3r_scene.figure, T_world_cams[i].squeeze().cpu().numpy(), label=f'cam{i}', linelength=0.1, linewidth=10)
+                    plot_points(dust3r_scene.figure, save_pointmaps[i].reshape(-1, 3)[::pointmap_subsample].T, size=1, name=f'pointmap{i}', color=colors[i][::pointmap_subsample])
+
+                dust3r_scene.plot_scene_to_html('dust3r_scene')
+
             # update last camera reference
             T_world_cam1 = T_world_cam2
         else:
+            # not yet implemented for window_size > 2
+            assert not args.save_imgs
+            assert not args.save_pts
+
             if batch_idx == 0:
                 chain_pose_list_from_idx = 1
             else:
@@ -273,6 +362,22 @@ if __name__ == '__main__':
             save_T_world_cams = torch.cat(T_world_cams, dim=0)
             torch.save(save_T_world_cams, f"{exp_dir}/poses.pt")
 
+            out_intrinsics = np.stack(save_intrinsics, axis=0)
+            out_imgs = np.stack(save_imgs, axis=0)
+            out_pointmaps = np.stack(save_pointmaps, axis=0)
+            np.save(f"{exp_dir}/intrinsics.npy", out_intrinsics)
+            np.save(f"{exp_dir}/imgs.npy", out_imgs)
+            np.save(f"{exp_dir}/pointmaps.npy", out_pointmaps)
+
     save_T_world_cams = torch.cat(T_world_cams, dim=0)
     torch.save(save_T_world_cams, f"{exp_dir}/poses.pt")
+
+    out_intrinsics = np.stack(save_intrinsics, axis=0)
+    out_imgs = np.stack(save_imgs, axis=0)
+    out_pointmaps = np.stack(save_pointmaps, axis=0)
+    np.save(f"{exp_dir}/intrinsics.npy", out_intrinsics)
+    np.save(f"{exp_dir}/imgs.npy", out_imgs)
+    np.save(f"{exp_dir}/pointmaps.npy", out_pointmaps)
+
     print(f"Saved {len(T_world_cams)} poses to {exp_dir}/poses.pt")
+
