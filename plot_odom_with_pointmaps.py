@@ -11,7 +11,7 @@ import open3d as o3d
 import open3d.core as o3c
 
 from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points, plot_points_sequence
-from utils.csv_odom import find_closest_timestamps, slerp_closets_odomcam
+from utils.csv_odom import find_closest_timestamps, slerp_closets_odomcam, read_csv_odom
 from tap import Tap
 
 from utils.pointmaps import transform_pointmap
@@ -55,44 +55,7 @@ if __name__ == '__main__':
     )
 
     # parse csv
-    T_world_gtsamCams_dict = {}
-    timestamps_dict = {}
-
-    T_robot_cam = np.eye(4)
-    T_robot_cam[:3, :3] = R.from_euler('xyz', [180, 0, -90], degrees=True).as_matrix()
-    with open(args.csv, newline='') as csvfile:
-        reader = csv.reader(csvfile)
-        for row_idx, row in enumerate(reader):
-            if row_idx == 0:
-                # ignore header
-                continue
-            timestamp, pose_type, x, y, z, qx, qy, qz, qw = row
-            if "landmark" in pose_type:
-                continue
-
-            translation = np.array([float(x), float(y), float(z)])
-            rotation = R.from_quat([float(qx), float(qy), float(qz), float(qw)])
-            T_world_robot = np.eye(4)
-            T_world_robot[:3, :3] = rotation.as_matrix()
-            T_world_robot[:3, 3] = translation
-
-            T_world_cam = torch.from_numpy(np.matmul(T_world_robot, T_robot_cam)).float()
-
-            if pose_type not in T_world_gtsamCams_dict:
-                T_world_gtsamCams_dict[pose_type] = []
-                timestamps_dict[pose_type] = []
-            T_world_gtsamCams_dict[pose_type].append(T_world_cam)
-            timestamps_dict[pose_type].append(float(timestamp))
-
-    for k, v in timestamps_dict.items():
-        timestamps_dict[k] = np.array(v)
-    for k, v in T_world_gtsamCams_dict.items():
-        T_world_gtsamCams_dict[k] = torch.stack(v)
-
-    assert (np.allclose(timestamps_dict['odom'], timestamps_dict['optimized_odom_tag'], rtol=1e-8, atol=1e-8) and \
-            np.allclose(timestamps_dict['odom'], timestamps_dict['optimized_odom_visodom_tag'], rtol=1e-8, atol=1e-8) and \
-            np.allclose(timestamps_dict['optimized_odom_visodom_tag'], timestamps_dict['optimized_odom_tag'], rtol=1e-8, atol=1e-8))
-    timestamps = timestamps_dict['odom']
+    T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(args.csv)
     koi = args.koi
 
     # get data from dust3r
@@ -126,10 +89,10 @@ if __name__ == '__main__':
     T_world_odomCams = []
     if not args.use_slerp_poses:
         # approach 1: for each dust3r image, find the odometry pose with the closest timestamp
-        T_world_odomCams = find_closest_timestamps(dust3r_image_timestamps, timestamps, T_world_gtsamCams_dict[koi])
+        T_world_odomCams = find_closest_timestamps(dust3r_image_timestamps, odom_timestamps, T_world_gtsamCams_dict[koi])
     else:
         # approach 2: for each dust3r image, slerp between the odometry poses with the closest timestamps
-        T_world_odomCams = slerp_closets_odomcam(dust3r_image_timestamps, timestamps, T_world_gtsamCams_dict[koi])
+        T_world_odomCams = slerp_closets_odomcam(dust3r_image_timestamps, odom_timestamps, T_world_gtsamCams_dict[koi])
 
     # plot things
     full_pointmaps_wrt_world = []

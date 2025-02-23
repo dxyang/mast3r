@@ -35,7 +35,17 @@ def read_csv_odom(csv_fp):
                 T_world_gtsamCams_dict[pose_type].append(T_world_cam)
                 timestamps_dict[pose_type].append(float(timestamp))
 
-    return T_world_gtsamCams_dict, timestamps_dict
+    for k, v in timestamps_dict.items():
+        timestamps_dict[k] = np.array(v)
+    for k, v in T_world_gtsamCams_dict.items():
+        T_world_gtsamCams_dict[k] = torch.stack(v)
+
+    assert (np.allclose(timestamps_dict['odom'], timestamps_dict['optimized_odom_tag'], rtol=1e-8, atol=1e-8) and \
+            np.allclose(timestamps_dict['odom'], timestamps_dict['optimized_odom_visodom_tag'], rtol=1e-8, atol=1e-8) and \
+            np.allclose(timestamps_dict['optimized_odom_visodom_tag'], timestamps_dict['optimized_odom_tag'], rtol=1e-8, atol=1e-8))
+    timestamps = timestamps_dict['odom']
+
+    return T_world_gtsamCams_dict, timestamps
 
 def find_closest_timestamps(timestamps, odom_timestamps, T_world_odomCams):
     closest_T_world_odomCams = []
