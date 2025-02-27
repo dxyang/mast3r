@@ -7,6 +7,42 @@ import torch
 K_T_ROBOT_CAM =np.eye(4)
 K_T_ROBOT_CAM[:3, :3] = R.from_euler('xyz', [180, 0, -90], degrees=True).as_matrix()
 
+def get_closest_apriltag_pose(t, apriltag_timestamps, T_cam_apriltags, max_delta_t_s=0.05):
+    closest_idx = np.argmin(np.abs(apriltag_timestamps - t))
+    delta = np.abs(apriltag_timestamps[closest_idx] - t)
+    if delta < max_delta_t_s:
+        return True, T_cam_apriltags[closest_idx]
+    else:
+        return False, torch.eye(4)
+
+def read_csv_apriltag(csv_fp):
+    T_cam_apriltags = []
+    timestamps = []
+
+    with open(csv_fp, newline='') as csvfile:
+            reader = csv.reader(csvfile)
+            for row_idx, row in enumerate(reader):
+                if row_idx == 0:
+                    # ignore header
+                    continue
+                timestamp, x, y, z, qx, qy, qz, qw, mean_error = row
+
+                translation = np.array([float(x), float(y), float(z)])
+                rotation = R.from_quat([float(qx), float(qy), float(qz), float(qw)])
+                T_cam_apriltag = np.eye(4)
+                T_cam_apriltag[:3, :3] = rotation.as_matrix()
+                T_cam_apriltag[:3, 3] = translation
+
+                T_cam_apriltag = torch.from_numpy(T_cam_apriltag).float()
+
+                T_cam_apriltags.append(T_cam_apriltag)
+                timestamps.append(float(timestamp))
+
+    timestamps = np.array(timestamps)
+    T_cam_apriltags = torch.stack(T_cam_apriltags)
+
+    return T_cam_apriltags, timestamps
+
 def read_csv_odom(csv_fp):
     T_world_gtsamCams_dict = {}
     timestamps_dict = {}
@@ -66,7 +102,6 @@ def slerp_poses(T_world_cam1, T_world_cam2, alpha):
     R1 = R.from_matrix(T_world_cam2[:3, :3].cpu().numpy())
     slerp = Slerp([0, 1], R.concatenate([R0, R1]))
     R_slerp = slerp(alpha).as_matrix()
-
     T_world_slerpedCam = torch.eye(4)
     T_world_slerpedCam[:3, :3] = torch.from_numpy(R_slerp)
     T_world_slerpedCam[:3, 3] = t_slerp
@@ -87,14 +122,15 @@ def slerp_closets_odomcam(timestamps, odom_timestamps, T_world_odomCams):
         if odometry_timestamp_idx == 0:
             # we are pretty far behind the first odometry timestamp
             T_world_odomCamDust3r = T_world_odomCams[0]
-        elif odometry_timestamp_idx == len(timestamps) - 1:
+        elif odometry_timestamp_idx == len(odom_timestamps) - 1:
             # we are pretty far ahead of the last odometry timestamp
             T_world_odomCamDust3r = T_world_odomCams[-1]
         else:
             # calculate slerp alpha
-            t0 = timestamps[odometry_timestamp_idx - 1]
-            t1 = timestamps[odometry_timestamp_idx]
+            t0 = odom_timestamps[odometry_timestamp_idx - 1]
+            t1 = odom_timestamps[odometry_timestamp_idx]
             alpha = (dust3r_ts - t0) / (t1 - t0)
+
             # apply slerp
             T_world_odomCam0 = T_world_odomCams[odometry_timestamp_idx - 1]
             T_world_odomCam1 = T_world_odomCams[odometry_timestamp_idx]
