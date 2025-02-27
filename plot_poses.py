@@ -6,6 +6,8 @@ from scipy.spatial.transform import Rotation as R
 import numpy as np
 import torch
 
+import open3d as o3d
+import open3d.core as o3c
 
 
 from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points, plot_points_sequence
@@ -21,6 +23,9 @@ class ArgParser(Tap):
 
     export_pose_csv: bool = False
     plot_pointmap_scene: bool = False
+
+    write_o3d_pcd: bool = False
+    o3d_ss: int = 20
 
     #
     seven_scenes_dir: str = os.path.expanduser("~/localdata/7scenes")
@@ -45,7 +50,7 @@ if __name__ == '__main__':
     else:
         xmin, xmax = -10, 10
         ymin, ymax = -10, 10
-        zmin, zmax = -5, 15
+        zmin, zmax = -15, 5
 
     tf_scene = PlotlyScene(
         size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
@@ -96,7 +101,7 @@ if __name__ == '__main__':
         pcd_xyz.append(T_world_cam[:3, 3])
 
     pcd_xyz = torch.stack(pcd_xyz, dim=1).cpu().numpy()
-
+    import pdb; pdb.set_trace()
     plot_points_sequence(pcd_scene.figure, pcd_xyz, size=10, name='camera_poses')
 
     if args.plot_transforms:
@@ -126,6 +131,25 @@ if __name__ == '__main__':
                 plot_points(dust3r_scene.figure, saved_pointmaps[i].reshape(-1, 3)[::pointmap_subsample].T, size=1, name=f'pointmap_{i}', color=colors[i][::pointmap_subsample])
 
         dust3r_scene.plot_scene_to_html(f"{exp_dir}/dust3r_scene")
+
+    if args.write_o3d_pcd:
+        # load imgs and pointmaps
+        saved_imgs = np.load(f"{exp_dir}/imgs.npy")
+        saved_pointmaps = np.load(f"{exp_dir}/pointmaps.npy")
+
+        o3d_colors = []
+        o3d_pointmaps = []
+        for pointmap_wrt_world, viz_img in zip(saved_pointmaps, saved_imgs):
+            o3d_pointmaps.append(pointmap_wrt_world.reshape(-1, 3)[::args.o3d_ss])
+            o3d_colors.append(viz_img.reshape(-1, 3)[::args.o3d_ss])
+        o3d_colors = np.clip(np.concatenate(o3d_colors, axis=0).astype(np.float32) / 255.0, 0.0, 1.0)
+        o3d_pointmaps = np.concatenate(o3d_pointmaps, axis=0)
+        pcd = o3d.t.geometry.PointCloud(o3d_pointmaps)
+        pcd.point.colors = o3d_colors
+        print(pcd, "\n")
+        print(o3d_pointmaps.shape)
+        print(o3d_colors.shape)
+        o3d.io.write_point_cloud(f"{exp_dir}/full_pointmap_ss{args.o3d_ss}.ply", pcd.to_legacy(), print_progress=True)
 
     if args.export_pose_csv:
         # export poses to csv format
