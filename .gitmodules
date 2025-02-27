@@ -2,3 +2,6 @@
 	path = dust3r
 	url = https://github.com/dxyang/dust3r
 	branch = main
+[submodule "gsplat"]
+	path = gsplat
+	url = git@github.com:nerfstudio-project/gsplat.git
