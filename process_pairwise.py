@@ -28,8 +28,8 @@ from mast3r_helpers import get_mast3r_output, scale_intrinsics
 
 from tap import Tap
 
+from utils.csv_odom import read_csv_odom, slerp_closets_odomcam, read_csv_apriltag, get_closest_apriltag_pose
 from utils.pointmaps import transform_pointmap
-
 '''
 # original images
 --image_dir "/srv/warplab/tektite/jobs/Yawzi_2024_11_14/rosbag_extracted/RAW"
@@ -79,13 +79,14 @@ class ArgParser(Tap):
     use_rosbag_raw: bool = False
     use_7scenes: bool = False
 
-    use_preset_pose_csv: str = None
+    use_pose_csv: bool = False
+    use_apriltag_csv: bool = False
 
 if __name__ == '__main__':
     device = 'cuda'
     schedule = 'cosine'
     lr = 0.01
-    niter = 300
+    niter = 50 #100
 
     args = ArgParser().parse_args()
 
@@ -107,6 +108,12 @@ if __name__ == '__main__':
     if args.num_images > 0:
         sorted_image_list = sorted_image_list[:args.num_images]
 
+    dust3r_image_timestamps = []
+    for img_name in sorted_image_list:
+        ts_s, ts_ns = float(img_name.split('.')[0].split('-')[0]), float(img_name.split('.')[0].split('-')[1])
+        aggregate_ts = ts_s + ts_ns / 1e9
+        dust3r_image_timestamps.append(aggregate_ts)
+
     image_fp_list = [f"{args.image_dir}/{image_fp}" for image_fp in sorted_image_list]
 
     # you can put the path to a local checkpoint in model_name if needed
@@ -124,6 +131,20 @@ if __name__ == '__main__':
         step_size = math.floor(args.window_size / 2)
         num_batches = len([i for i in range(0, len(image_fp_list) - args.window_size + 1, step_size)])
 
+    # load csv for preset poses of each image
+    if args.use_pose_csv:
+        print(f"loading odometry csv!")
+        csv_odom_fp = "02212025_compare_trajectories.csv"
+        T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(csv_odom_fp)
+        koi = "optimized_odom_visodom_tag"
+        T_world_odomCams = slerp_closets_odomcam(dust3r_image_timestamps, odom_timestamps, T_world_gtsamCams_dict[koi])
+
+    # parse apriltag csv
+    if args.use_apriltag_csv:
+        print(f"loading apriltag csv!")
+        csv_apriltag_fp = "yawzi_apriltag_poses.csv"
+        T_cam_apriltags, apriltag_timestamps = read_csv_apriltag(csv_apriltag_fp)
+
     # detect what the middle crop size should be
     if args.crop_middle:
         img = PIL.Image.open(image_fp_list[0]).convert("RGB")
@@ -137,10 +158,15 @@ if __name__ == '__main__':
 
     # desired outputs
     T_world_cam1 = torch.eye(4)
+    if args.use_pose_csv:
+        T_world_cam1 = T_world_odomCams[0]
     T_world_cams = [T_world_cam1.unsqueeze(0)]
     save_intrinsics = []
     save_imgs = []
     save_pointmaps = []
+    dbg_save_pointmaps = []
+
+    last_center_depth = 1.0
 
     # process the images in batches
     for batch_idx, start_idx in enumerate(tqdm.tqdm(range(0, len(image_fp_list) - args.window_size + 1, step_size))):
@@ -221,61 +247,131 @@ if __name__ == '__main__':
                 images = load_images(image_fp_list[start_idx:start_idx+args.window_size], size=512, verbose=False, crop=center_crop if args.crop_middle else None)
 
             pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
-            # dxy: I think a larger batch size should be ok here?
             output = inference(pairs, model, device, batch_size=1, verbose=False)
 
-            if args.window_size == 2:
+            if args.window_size == 2 and not args.use_pose_csv:
                 scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PairViewer, verbose=False, adjust_min_conf=args.adjust_min_conf) # min_conf_thr=2  or whatever if you wanted to play with it
             else:
                 scene = global_aligner(output, device=device, mode=GlobalAlignerMode.PointCloudOptimizer, verbose=False)
-                loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
+                if args.use_pose_csv:
+                    scene.preset_pose(T_world_odomCams[start_idx:start_idx+args.window_size])
+                    # scene.preset_focal([256.0, 256.0])
+                    # scene.preset_principal_point([[256.0,192.0], [256.0,192.0]])
+                    # loss = scene.compute_global_alignment(init="known_poses", niter=niter, schedule=schedule, lr=lr)
+                    loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
+                else:
+                    loss = scene.compute_global_alignment(init="mst", niter=niter, schedule=schedule, lr=lr)
 
             # retrieve useful values from scene:
             imgs = scene.imgs
-            intrinsics = [k.cpu().numpy() for k in scene.get_intrinsics()]
+            intrinsics = [k.detach().cpu().numpy() for k in scene.get_intrinsics()]
             poses = [p.detach().cpu() for p in scene.get_im_poses()]
-            pts3d = [pts3d.cpu() for pts3d in scene.get_pts3d()]
+            pts3d = [pts3d.detach().cpu() for pts3d in scene.get_pts3d()]
+            pps = [pp.detach().cpu().numpy() for pp in scene.get_principal_points()]
             # confidence_masks = scene.get_masks()
 
+            for pose in poses:
+                rotation = pose[:3, :3]
+                rotation_transpose = rotation.transpose(0, 1)
+                assert torch.allclose(torch.matmul(rotation, rotation_transpose), torch.eye(3), rtol=1e-3, atol=1e-3)
+            # assert torch.allclose(poses[0], T_world_odomCams[start_idx])
+            # assert torch.allclose(poses[1], T_world_odomCams[start_idx+1])
+
             if args.window_size == 2:
-                # get relative image poses
-                # if torch.equal(poses[0], torch.eye(4)):
-                if scene.ref_is_cam1:
-                    # camera 1 is the reference
-                    T_cam1_cam2 = poses[1]
-                    pointmap1_wrt_cam1 = pts3d[0]
-                    pointmap2_wrt_cam1 = pts3d[1]
-                # if torch.equal(poses[1], torch.eye(4)):
-                if not scene.ref_is_cam1:
-                    # camera 2 is the reference
-                    T_cam2_cam1 = poses[0]
-                    T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
+                if args.use_pose_csv:
+                    # get relative image poses
+                    T_cam1_cam2 = torch.matmul(torch.linalg.inv(T_world_odomCams[start_idx]), T_world_odomCams[start_idx+1])
 
-                    pointmap1_wrt_cam2 = pts3d[0] # W x H x 3
-                    pointmap2_wrt_cam2 = pts3d[1]
+                    # pointmaps are already in world frame
+                    pointmap1_wrt_world = pts3d[0]
+                    pointmap2_wrt_world = pts3d[1]
 
-                    pointmap1_wrt_cam1 = transform_pointmap(pointmap1_wrt_cam2, T_cam1_cam2)
-                    pointmap2_wrt_cam1 = transform_pointmap(pointmap1_wrt_cam2, T_cam1_cam2)
+                    pointmap1_wrt_cam1 = transform_pointmap(pointmap1_wrt_world, torch.linalg.inv(T_world_odomCams[start_idx]))
+                    pointmap2_wrt_cam2 = transform_pointmap(pointmap2_wrt_world, torch.linalg.inv(T_world_odomCams[start_idx+1]))
+                else:
+                    # get relative image poses
+                    if scene.ref_frame == 0:
+                        # camera 1 is the reference
+                        T_cam1_cam2 = poses[1]
+                        pointmap1_wrt_cam1 = pts3d[0]
+                        pointmap2_wrt_cam1 = pts3d[1]
 
-                    # pcd1_wrt_cam2 = pointmap1_wrt_cam2.view(-1, 3) # N x 3
-                    # pcd2_wrt_cam2 = pointmap2_wrt_cam2.view(-1, 3)
+                        T_cam2_cam1 = torch.linalg.inv(T_cam1_cam2)
+                        pointmap2_wrt_cam2 = transform_pointmap(pointmap2_wrt_cam1, T_cam2_cam1)
+                    elif scene.ref_frame == 1:
+                        # camera 2 is the reference
+                        T_cam2_cam1 = poses[0]
+                        T_cam1_cam2 = torch.linalg.inv(T_cam2_cam1)
 
-                    # hpcd1_wrt_cam2 = torch.cat([pcd1_wrt_cam2, torch.ones(pcd1_wrt_cam2.shape[0], 1)], dim=1) # N x 4
-                    # hpcd2_wrt_cam2 = torch.cat([pcd2_wrt_cam2, torch.ones(pcd2_wrt_cam2.shape[0], 1)], dim=1)
+                        pointmap1_wrt_cam2 = pts3d[0] # W x H x 3
+                        pointmap2_wrt_cam2 = pts3d[1]
 
-                    # hpcd1_wrt_cam1 = torch.matmul(T_cam2_cam1, hpcd1_wrt_cam2.T).T # N x 4
-                    # hpcd2_wrt_cam1 = torch.matmul(T_cam2_cam1, hpcd2_wrt_cam2.T).T
+                        pointmap1_wrt_cam1 = transform_pointmap(pointmap1_wrt_cam2, T_cam1_cam2)
+                        pointmap2_wrt_cam1 = transform_pointmap(pointmap2_wrt_cam2, T_cam1_cam2)
+                    else:
+                        assert False # unsupported?
 
-                    # pcd1_wrt_cam1 = hpcd1_wrt_cam1[:, :3]
-                    # pcd2_wrt_cam1 = hpcd2_wrt_cam1[:, :3]
 
-                    # pointmap1_wrt_cam1 = pcd1_wrt_cam1.reshape(pointmap1_wrt_cam2.shape)
-                    # pointmap2_wrt_cam1 = pcd2_wrt_cam1.reshape(pointmap2_wrt_cam2.shape)
+                # if we have an apriltag pose, we can scale the pointclouds to that
+                # no need to chain to depth of the last image
+                res = False
+                if args.use_apriltag_csv:
+                    curr_ts = dust3r_image_timestamps[start_idx + 1]
+                    res, T_cam_tag = get_closest_apriltag_pose(curr_ts, apriltag_timestamps, T_cam_apriltags, max_delta_t_s=0.5)
+                if res:
+                    # hack: let's say apriltag depth should be average depth of the image?
+                    curr_center_depth = pointmap2_wrt_cam2[int(pps[1][1]), int(pps[1][0]), 2]
+                    apriltag_depth = T_cam_tag[2, 3]
+                    scaling = apriltag_depth / curr_center_depth
+
+                    # do scaling
+                    if batch_idx == 0:
+                        res, T_cam_tag = get_closest_apriltag_pose(dust3r_image_timestamps[start_idx], apriltag_timestamps, T_cam_apriltags, max_delta_t_s=0.5)
+                        assert res
+                        start_scaling = T_cam_tag[2, 3] / pointmap1_wrt_cam1[int(pps[0][1]), int(pps[0][0]), 2]
+                        pointmap1_wrt_cam1 *= start_scaling
+                    else:
+                        pointmap1_wrt_cam1 *= scaling
+
+                    pointmap2_wrt_cam2 *= scaling
+
+                    # update pointmaps wrt cam 1
+                    pointmap2_wrt_cam1 = transform_pointmap(pointmap2_wrt_cam2, T_cam1_cam2)
+
+                    # bring pointmaps back to world frame because pose csv file usage
+                    if args.use_pose_csv:
+                        pointmap1_wrt_world = transform_pointmap(pointmap1_wrt_cam1, T_world_odomCams[start_idx])
+                        pointmap2_wrt_world = transform_pointmap(pointmap2_wrt_cam2, T_world_odomCams[start_idx+1])
+                else:
+                    # scale the two pointclouds based on where we left last image
+                    # get center of pointmap1 wrt cam 1
+                    if batch_idx == 0:
+                        pass
+                    else:
+                        # figure scaling by dividing by last center of pointmap (pointmap2_wrt_cam2 in last batch)
+                        curr_center_depth = pointmap1_wrt_cam1[int(pps[0][1]), int(pps[0][0]), 2]
+                        scaling = last_center_depth / curr_center_depth
+
+                        # do scaling
+                        pointmap1_wrt_cam1 *= scaling
+                        pointmap2_wrt_cam2 *= scaling
+
+                        # update pointmaps wrt cam 1
+                        pointmap2_wrt_cam1 = transform_pointmap(pointmap2_wrt_cam2, T_cam1_cam2)
+
+                        # bring pointmaps back to world frame because pose csv file usage
+                        if args.use_pose_csv:
+                            pointmap1_wrt_world = transform_pointmap(pointmap1_wrt_cam1, T_world_odomCams[start_idx])
+                            pointmap2_wrt_world = transform_pointmap(pointmap2_wrt_cam2, T_world_odomCams[start_idx+1])
+
+                # update last center of pointmap
+                last_center_depth = pointmap2_wrt_cam2[int(pps[1][1]), int(pps[1][0]), 2]
 
                 if torch.equal(poses[0], torch.eye(4)) and torch.equal(poses[1], torch.eye(4)):
                     print(f"Warning: both poses are identity matrices for batch: {image_fp_list[start_idx:start_idx+args.window_size]}")
             else:
                 # poses are all T_world_cam but we want relative poses from the last cam
+                # for any given window, which cam is the refernce is non-consistent
                 T_world_lastcam = torch.eye(4)
                 T_lastcam_currcam_list = []
                 for pose_idx, T_world_cam in enumerate(poses):
@@ -285,7 +381,10 @@ if __name__ == '__main__':
 
         if args.window_size == 2:
             # get the current cameras in world frame
-            T_world_cam2 = torch.matmul(T_world_cam1, T_cam1_cam2)
+            if args.use_pose_csv:
+                T_world_cam2 = T_world_odomCams[start_idx+1]
+            else:
+                T_world_cam2 = torch.matmul(T_world_cam1, T_cam1_cam2)
             T_world_cams.append(T_world_cam2.unsqueeze(0))
 
             # saving images so have color for pointclouds
@@ -301,11 +400,17 @@ if __name__ == '__main__':
                 assert not args.use_mast3r
 
                 # need to convert pointmaps to world frame
-                if batch_idx == 0:
+                # extra compute happening, could just do the second one...
+                if not args.use_pose_csv:
                     pointmap1_wrt_world = transform_pointmap(pointmap1_wrt_cam1, T_world_cam1)
+                    pointmap2_wrt_world = transform_pointmap(pointmap2_wrt_cam1, T_world_cam1)
+
+                if batch_idx == 0:
                     save_pointmaps.append(pointmap1_wrt_world.numpy())
-                pointmap2_wrt_world = transform_pointmap(pointmap2_wrt_cam1, T_world_cam1)
                 save_pointmaps.append(pointmap2_wrt_world.numpy())
+
+                # dbg_save_pointmaps.append((batch_idx, start_idx, pointmap1_wrt_world.numpy().copy()))
+                # dbg_save_pointmaps.append((batch_idx, start_idx + 1, pointmap2_wrt_world.numpy().copy()))
 
             if batch_idx == 0:
                 save_intrinsics.append(intrinsics[0])
@@ -313,15 +418,15 @@ if __name__ == '__main__':
 
             # debug the scene here
             dxy_dbg = False
-            if dxy_dbg and batch_idx == 300:
+            if dxy_dbg and batch_idx == 5:
                 from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points
-                xmin, xmax = -6, 6
-                ymin, ymax = -6, 6
-                zmin, zmax = -5, 5
+                xmin, xmax = -10, 10
+                ymin, ymax = -10, 10
+                zmin, zmax = -15, 5
                 dust3r_scene = PlotlyScene(
                     size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
                 )
-                pointmap_subsample = 100
+                pointmap_subsample = 10
 
                 colors = []
                 for viz_img in save_imgs:
@@ -331,9 +436,13 @@ if __name__ == '__main__':
 
                 for i in range(len(T_world_cams)):
                     plot_transform(dust3r_scene.figure, T_world_cams[i].squeeze().cpu().numpy(), label=f'cam{i}', linelength=0.1, linewidth=10)
-                    plot_points(dust3r_scene.figure, save_pointmaps[i].reshape(-1, 3)[::pointmap_subsample].T, size=1, name=f'pointmap{i}', color=colors[i][::pointmap_subsample])
+                    plot_points(dust3r_scene.figure, save_pointmaps[i].reshape(-1, 3)[::pointmap_subsample].T, size=2, name=f'pointmap{i}', color=colors[i][::pointmap_subsample])
 
-                dust3r_scene.plot_scene_to_html('dust3r_scene')
+                # for b_idx, s_idx, pmap in dbg_save_pointmaps:
+                #     plot_points(dust3r_scene.figure, pmap.reshape(-1, 3)[::pointmap_subsample].T, size=2, name=f'pointmap_{b_idx}_{s_idx}', color=colors[s_idx][::pointmap_subsample])
+
+                dust3r_scene.plot_scene_to_html('dust3r_scene3')
+                import pdb; pdb.set_trace()
 
             # update last camera reference
             T_world_cam1 = T_world_cam2

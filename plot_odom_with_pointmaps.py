@@ -11,7 +11,7 @@ import open3d as o3d
 import open3d.core as o3c
 
 from utils.plotly_viz_utils import PlotlyScene, plot_transform, plot_points, plot_points_sequence
-from utils.csv_odom import find_closest_timestamps, slerp_closets_odomcam, read_csv_odom
+from utils.csv_odom import find_closest_timestamps, slerp_closets_odomcam, read_csv_odom, read_csv_apriltag
 from tap import Tap
 
 from utils.pointmaps import transform_pointmap
@@ -23,12 +23,22 @@ python plot_odom_with_pointmaps.py \
 --o3d_ss 10 \
 --use_slerp_poses
 --num_images 1000
+
+
+python plot_odom_with_pointmaps.py \
+--csv 02212025_compare_trajectories.csv \
+--do_midcrop \
+--o3d_ss 10 \
+--use_slerp_poses
+--num_images 1000
+
 '''
 
 class ArgParser(Tap):
     csv: str
     koi: str = "optimized_odom_visodom_tag"
 
+    apriltag_csv: str = "yawzi_apriltag_poses"
 
     plot_plotly: bool = False
 
@@ -38,6 +48,8 @@ class ArgParser(Tap):
     num_images: int = -1
 
     use_slerp_poses: bool = False
+
+    use_dust3r_poses: bool = False
 
 if __name__ == '__main__':
     device = 'cuda'
@@ -57,6 +69,9 @@ if __name__ == '__main__':
     # parse csv
     T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(args.csv)
     koi = args.koi
+
+    # parse apriltag csv
+    T_cam_apriltags, apriltag_timestamps = read_csv_apriltag(args.apriltag_csv)
 
     # get data from dust3r
     if args.do_midcrop:
