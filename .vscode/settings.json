@@ -1,5 +1,6 @@
 {
     "python.analysis.extraPaths": [
-        "./dust3r"
+        "./dust3r",
+        "./gsplat"
     ]
 }
