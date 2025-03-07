@@ -49,6 +49,7 @@ class Parser:
         ), f"COLMAP directory {colmap_dir} does not exist."
 
         manager = SceneManager(colmap_dir)
+        self.manager = manager
         manager.load_cameras()
         manager.load_images()
         manager.load_points3D()
@@ -379,11 +380,14 @@ class Dataset:
             )
             points = points[selector]
             depths = depths[selector]
+            point_indices = point_indices[selector]
             data["points"] = torch.from_numpy(points).float()
             data["depths"] = torch.from_numpy(depths).float()
+            data["points_rgb"] = torch.from_numpy(self.parser.points_rgb[point_indices]).float()
+            data["points_xyz"] = torch.from_numpy(self.parser.points[point_indices]).float()
+            data["point_indices"] = point_indices.tolist()
 
         return data
-
 
 class SpatialDataset:
     """A dataset wrapper class that returns a spatially sampled image."""
@@ -456,15 +460,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
     parser.add_argument("--factor", type=int, default=4)
+    parser.add_argument("--test_every", type=int, default=1e6) # don't have any images in the test
     args = parser.parse_args()
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
+        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=args.test_every
     )
     dataset = Dataset(parser, split="train", load_depths=False)
-    spatial_dataset = SpatialDataset(dataset)
     print(f"Dataset: {len(dataset)} images.")
+    import pdb; pdb.set_trace()
 
     # writer = imageio.get_writer("results/points.mp4", fps=30)
     # for data in tqdm.tqdm(dataset, desc="Plotting points"):
