@@ -77,9 +77,16 @@ class Config:
     # sliding window size for optimizing
     sliding_window: int = 5
 
+    full_splat_opt: bool = False
+    full_splat_opt_every: int = 100
+    full_splat_opt_steps: int = 1000
+
     # use isotropic gaussians
     isotropic: bool = True
 
+    # debugging
+    start_image_idx: int = 0
+    num_total_images: int = 1e10
 
     # Number of training steps
     max_steps: int = 30_000
@@ -202,7 +209,7 @@ class Runner:
         # Obtain init pointcloud from parser
         global_pcd_indices = set([])
         for idx in range(cfg.num_init_images):
-            data = self.trainset[idx]
+            data = self.trainset[cfg.start_image_idx + idx]
             global_pcd_indices = global_pcd_indices.union(data["point_indices"])
         global_pcd_indices = list(global_pcd_indices)
 
@@ -347,10 +354,12 @@ class Runner:
         self.global_step = 0
         pbar = tqdm.tqdm(range(len(self.trainset)))
         for idx in pbar:
-            if idx < cfg.num_init_images:
+            if idx < cfg.start_image_idx + cfg.num_init_images:
                 continue
-            elif idx == cfg.num_init_images:
+            elif idx == cfg.start_image_idx + cfg.num_init_images:
                 self.splat_optimization(pbar, cfg.num_init_steps, list(range(cfg.num_init_images)))
+            elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
+                break
 
             # add a new image to the gaussian model
             data = self.trainset[idx]
@@ -365,7 +374,16 @@ class Runner:
             )
             self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
 
+            if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
+                self.splat_optimization(pbar, cfg.full_splat_opt_steps, [i for i in range(idx)])
+
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
+        print(f"Saving model")
+        data = {"step": self.global_step, "splats": self.splats.state_dict()}
+        torch.save(
+            data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
+        )
+        import pdb; pdb.set_trace()
         print(f"Optimizing the whole scene for {self.max_steps - self.global_step} steps")
         self.splat_optimization(pbar, self.max_steps - self.global_step + 1, [i for i in range(len(self.trainset))])
 
@@ -406,7 +424,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED", # always render depth in the training loop, ED = expected depth (D / alpha)
+                render_mode="RGB", #"RGB+ED", # always render depth in the training loop, ED = expected depth (D / alpha)
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -595,20 +613,28 @@ if __name__ == "__main__":
             Config(
                 strategy=DefaultStrategy(
                     verbose=True,
-                    do_opacity_reset=False,
+                    grow_grad2d=0.0002, #0.0008,
+                    grow_scale3d=0.01 / 3.0, # / 15.0,
+                    prune_scale3d=0.1 / 3.0, # / 15.0,
                     refine_start_iter = 10_000, # probably similar to num_init_steps
                     refine_stop_iter = 500_000,
-                    reset_every = 10_000, # this is cancelled out /shrug
-                    refine_every = 250, # probably similar to num_add_steps
+                    reset_every = 10_000, # this is not used / commented out /shrug
+                    refine_every = 250, # probably similar to num_add_steps,
+                    absgrad=False, # if absgrad is True, should set grow_grad2d = 0.0008
+                    revised_opacity=False, # default False
+                    do_opacity_reset=False,
                 ),
-                visible_adam=False,
+                visible_adam=True,
                 num_init_images=10,
                 num_init_steps=500,
                 num_add_steps=50,
                 sliding_window=5,
                 max_steps=500_000,
-                save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000]
-
+                save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000],
+                full_splat_opt = False,
+                full_splat_opt_every = 100,
+                full_splat_opt_steps = 100,
+                far_plane=10.0
             ),
         ),
         "original_default": (
