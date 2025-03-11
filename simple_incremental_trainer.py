@@ -74,6 +74,8 @@ class Config:
     num_init_steps: int = 1000
     # number of optimization steps for every new image
     num_add_steps: int = 100
+    # sliding window size for optimizing
+    sliding_window: int = 5
 
     # use isotropic gaussians
     isotropic: bool = True
@@ -361,9 +363,11 @@ class Runner:
                 optimizers=self.optimizers,
                 state=self.strategy_state,
             )
-            sliding_window = 5
-            self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - sliding_window + 1, idx + 1)])
+            self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
 
+        print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
+        print(f"Optimizing the whole scene for {self.max_steps - self.global_step} steps")
+        self.splat_optimization(pbar, self.max_steps - self.global_step + 1, [i for i in range(len(self.trainset))])
 
     def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False):
         for step in range(num_steps):
@@ -452,7 +456,7 @@ class Runner:
             loss.backward()
 
             # a bunch of logging
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| " f"global step={self.global_step}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             pbar.set_description(desc)
@@ -587,6 +591,27 @@ if __name__ == "__main__":
     # Each is a tuple of (CLI description, config object).
     configs = {
         "default": (
+            "Gaussian splatting training using densification heuristics from the original paper.",
+            Config(
+                strategy=DefaultStrategy(
+                    verbose=True,
+                    do_opacity_reset=False,
+                    refine_start_iter = 10_000, # probably similar to num_init_steps
+                    refine_stop_iter = 500_000,
+                    reset_every = 10_000, # this is cancelled out /shrug
+                    refine_every = 250, # probably similar to num_add_steps
+                ),
+                visible_adam=False,
+                num_init_images=10,
+                num_init_steps=500,
+                num_add_steps=50,
+                sliding_window=5,
+                max_steps=500_000,
+                save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000]
+
+            ),
+        ),
+        "original_default": (
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(verbose=True),
