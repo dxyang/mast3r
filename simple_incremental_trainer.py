@@ -357,7 +357,7 @@ class Runner:
             if idx < cfg.start_image_idx + cfg.num_init_images:
                 continue
             elif idx == cfg.start_image_idx + cfg.num_init_images:
-                self.splat_optimization(pbar, cfg.num_init_steps, list(range(cfg.num_init_images)))
+                self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
             elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
                 break
 
