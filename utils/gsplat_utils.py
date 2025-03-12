@@ -9,6 +9,33 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 
 
+class AffineExposureOptModule(torch.nn.Module):
+    """Affine exposure optimization module."""
+
+    def __init__(self, n_cameras: int):
+        super().__init__()
+        self.exposures = torch.eye(3, 4)[None].repeat(n_cameras, 1, 1)
+        self.exposures = torch.nn.Parameter(self.exposures, requires_grad=True)
+
+    def forward(self, rgb_render: Tensor, camera_idxs: Tensor) -> Tensor:
+        """Adjust rendered image with transformation.
+
+        Args:
+            rgb_render: (B, H, W, C)
+            camera_idxs: (B,)
+
+        Returns:
+            updated rgb_render: B, H, W, C)
+        """
+        batch_size, H, W, C = rgb_render.shape
+        exposure = self.exposures[camera_idxs]  # (batch, 3, 4)
+
+        # Apply rotation and translation
+        rgb_render = torch.matmul(rgb_render, exposure[:, :3, :3]) + exposure[:, :, 3].unsqueeze(1).unsqueeze(1)
+        rgb_render = rgb_render.clamp(0.0, 1.0)
+
+        return rgb_render
+
 class CameraOptModule(torch.nn.Module):
     """Camera pose optimization module."""
 
