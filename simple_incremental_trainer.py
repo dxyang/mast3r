@@ -34,7 +34,7 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
 from splat.model import create_splats_with_optimizers, add_new_frame
-from utils.gsplat_utils import set_random_seed, seed_worker
+from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule
 
 
 @dataclass
@@ -83,6 +83,10 @@ class Config:
 
     # use isotropic gaussians
     isotropic: bool = True
+
+    exposure_optimization: bool = False
+    exposure_lr_init: float = 0.001
+
 
     # debugging
     start_image_idx: int = 0
@@ -240,6 +244,17 @@ class Runner:
             assert False
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
+        self.exposure_optimizers = []
+        if cfg.exposure_optimization:
+            self.exposure = AffineExposureOptModule(len(self.trainset)).to(self.device)
+            self.exposure_optimizers = [
+                torch.optim.Adam(
+                    self.exposure.parameters(),
+                    lr=cfg.exposure_lr_init,
+                )
+            ]
+            print(f"Exposure optimization enabled for {len(self.trainset)} cameras")
+
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
@@ -348,6 +363,13 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / self.max_steps)
             ),
         ]
+        if cfg.exposure_optimization:
+            # exposure optimization has a learning rate schedule
+            self.schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.exposure_optimizers[0], gamma=0.01 ** (1.0 / self.max_steps)
+                )
+            )
 
         # Iterative training loop
         self.global_tic = time.time()
@@ -359,6 +381,7 @@ class Runner:
             elif idx == cfg.start_image_idx + cfg.num_init_images:
                 self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
             elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
+                print(f"Reached {cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images} images, stopping training")
                 break
 
             # add a new image to the gaussian model
@@ -435,6 +458,9 @@ class Runner:
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=self.device)
                 colors = colors + bkgd * (1.0 - alphas)
+
+            if cfg.exposure_optimization:
+                colors = self.exposure(colors, torch.from_numpy(np.array([dset_idx])).to(self.device))
 
             # strategy pre backward
             self.cfg.strategy.step_pre_backward(
@@ -523,6 +549,9 @@ class Runner:
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.exposure_optimizers:
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in self.schedulers:
                 scheduler.step()
