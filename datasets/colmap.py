@@ -317,6 +317,8 @@ class Dataset:
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
+        elif split == "all":
+            self.indices = indices
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
 
@@ -457,19 +459,27 @@ if __name__ == "__main__":
     import imageio.v2 as imageio
     import tqdm
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
-    parser.add_argument("--factor", type=int, default=4)
-    parser.add_argument("--test_every", type=int, default=1e6) # don't have any images in the test
-    args = parser.parse_args()
+    argparser = argparse.ArgumentParser()
+    argparser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
+    argparser.add_argument("--factor", type=int, default=2)
+    argparser.add_argument("--test_every", type=int, default=1e6) # don't have any images in the test
+    args = argparser.parse_args()
 
     # Parse COLMAP data.
     parser = Parser(
         data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=args.test_every
     )
-    dataset = Dataset(parser, split="train", load_depths=False)
+    dataset = Dataset(parser, split="all", load_depths=False)
     print(f"Dataset: {len(dataset)} images.")
-    import pdb; pdb.set_trace()
+    for idx, data in enumerate(tqdm.tqdm(dataset)):
+        if args.factor == 2:
+            try:
+                assert data["image"].shape == (560, 994, 3)
+            except:
+                print(data["image"].shape)
+                print(parser.image_paths[idx])
+        else:
+            assert data["image"].shape == (560 * 2, 994 * 2, 3)
 
     # writer = imageio.get_writer("results/points.mp4", fps=30)
     # for data in tqdm.tqdm(dataset, desc="Plotting points"):
