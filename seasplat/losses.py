@@ -3,9 +3,6 @@ import math
 import torch
 import torch.nn as nn
 
-import torch
-import torch.nn as nn
-
 class SmoothDepthLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -18,6 +15,9 @@ class SmoothDepthLoss(nn.Module):
         """
         depth_dx = depth.diff(dim=-1)
         depth_dy = depth.diff(dim=-2)
+
+        import pdb; pdb.set_trace()
+        # maybe for a mask, we should just zero depth_dx/dy around the mask?
 
         rgb_dx = torch.mean(rgb.diff(dim=-1), axis=-3, keepdim=True)
         rgb_dy = torch.mean(rgb.diff(dim=-2), axis=-3, keepdim=True)

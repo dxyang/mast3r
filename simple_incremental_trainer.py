@@ -33,10 +33,10 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
+from seasplat.losses import SmoothDepthLoss
 from splat.model import create_splats_with_optimizers, add_new_frame
 from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule
-
-
+from utils.mask import get_yawzi_downward_mask
 @dataclass
 class Config:
     # Disable viewer
@@ -80,6 +80,11 @@ class Config:
     full_splat_opt: bool = False
     full_splat_opt_every: int = 100
     full_splat_opt_steps: int = 1000
+
+    apply_robo_mask: bool = False
+
+    smooth_depth_loss: bool = False
+    smooth_depth_lambda: float = 2.0
 
     # use isotropic gaussians
     isotropic: bool = True
@@ -206,9 +211,10 @@ class Runner:
         )
         self.trainset = Dataset(
             self.parser,
-            split="train",
+            split="all",
             load_depths=True,
         )
+        print(f"Dataset length: {len(self.trainset)}")
 
         # Obtain init pointcloud from parser
         global_pcd_indices = set([])
@@ -267,7 +273,7 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        # Losses & Metrics.
+        # Losses and Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         if cfg.lpips_net == "alex":
@@ -282,6 +288,8 @@ class Runner:
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
+        self.smooth_depth_criterion = SmoothDepthLoss()
+
         # Viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
@@ -290,6 +298,10 @@ class Runner:
                 render_fn=self._viewer_render_fn,
                 mode="training",
             )
+
+        # misc
+        if cfg.apply_robo_mask:
+            self.robo_mask = get_yawzi_downward_mask().to(self.device)
 
     def rasterize_splats(
         self,
@@ -447,7 +459,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB", #"RGB+ED", # always render depth in the training loop, ED = expected depth (D / alpha)
+                render_mode="RGB+ED" if cfg.smooth_depth_loss else "RGB", # ED = expected depth (D / alpha)
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -472,7 +484,10 @@ class Runner:
             )
 
             # calculate losses and backward
-            l1loss = F.l1_loss(colors, pixels)
+            if cfg.apply_robo_mask:
+                l1loss = F.l1_loss(colors * self.robo_mask, pixels * self.robo_mask)
+            else:
+                l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
@@ -497,10 +512,14 @@ class Runner:
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
+            if cfg.smooth_depth_loss:
+                smooth_depth_loss = self.smooth_depth_criterion(colors.permute(0, 3, 1, 2), depths.permute(0, 3, 1, 2))
+                loss += cfg.smooth_depth_lambda * smooth_depth_loss
+
             loss.backward()
 
             # a bunch of logging
-            desc = f"loss={loss.item():.3f}| " f"global step={self.global_step}| "
+            desc = f"loss={loss.item():.3f}| " f"num gs: {len(self.splats['means'])}| " f"step={self.global_step}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             pbar.set_description(desc)
@@ -510,6 +529,8 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), self.global_step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), self.global_step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), self.global_step)
+                if cfg.smooth_depth_loss:
+                    self.writer.add_scalar("train/smoothdepthloss", smooth_depth_loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), self.global_step)
                 self.writer.add_scalar("train/mem", mem, self.global_step)
                 if cfg.depth_loss:
@@ -643,12 +664,12 @@ if __name__ == "__main__":
                 strategy=DefaultStrategy(
                     verbose=True,
                     grow_grad2d=0.0002, #0.0008,
-                    grow_scale3d=0.01 / 3.0, # / 15.0,
-                    prune_scale3d=0.1 / 3.0, # / 15.0,
-                    refine_start_iter = 10_000, # probably similar to num_init_steps
+                    grow_scale3d=0.01 / 10.0, # / 15.0,
+                    prune_scale3d=0.1 / 10.0, # / 15.0,
+                    refine_start_iter = 250, # probably similar to num_init_steps
                     refine_stop_iter = 500_000,
-                    reset_every = 10_000, # this is not used / commented out /shrug
-                    refine_every = 250, # probably similar to num_add_steps,
+                    reset_every = 250, # this is not used / commented out /shrug
+                    refine_every = 100, # probably similar to num_add_steps,
                     absgrad=False, # if absgrad is True, should set grow_grad2d = 0.0008
                     revised_opacity=False, # default False
                     do_opacity_reset=False,
