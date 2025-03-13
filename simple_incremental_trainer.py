@@ -534,7 +534,7 @@ class Runner:
                 self.writer.add_scalar("train/l1loss", l1loss.item(), self.global_step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), self.global_step)
                 if cfg.smooth_depth_loss:
-                    self.writer.add_scalar("train/smoothdepthloss", smooth_depth_loss.item(), step)
+                    self.writer.add_scalar("train/smoothdepthloss", smooth_depth_loss.item(), self.global_step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), self.global_step)
                 self.writer.add_scalar("train/mem", mem, self.global_step)
                 if cfg.depth_loss:
