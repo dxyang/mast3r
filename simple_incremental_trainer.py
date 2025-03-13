@@ -513,7 +513,11 @@ class Runner:
                 loss += depthloss * cfg.depth_lambda
 
             if cfg.smooth_depth_loss:
-                smooth_depth_loss = self.smooth_depth_criterion(colors.permute(0, 3, 1, 2), depths.permute(0, 3, 1, 2))
+                smooth_depth_loss = self.smooth_depth_criterion(
+                    colors.permute(0, 3, 1, 2),
+                    depths.permute(0, 3, 1, 2),
+                    mask=self.robo_mask.permute(0, 3, 1, 2) if cfg.apply_robo_mask else None
+                )
                 loss += cfg.smooth_depth_lambda * smooth_depth_loss
 
             loss.backward()

@@ -7,17 +7,21 @@ class SmoothDepthLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, rgb, depth):
+    def forward(self, rgb, depth, mask=None):
         """
         Args:
             rgb: [batch, 3, H, W]
             depth: [batch, 1, H, W]
+            mask: [batch, H, W, 1]
         """
         depth_dx = depth.diff(dim=-1)
         depth_dy = depth.diff(dim=-2)
 
-        import pdb; pdb.set_trace()
-        # maybe for a mask, we should just zero depth_dx/dy around the mask?
+        # zero out the depth gradients around the mask
+        if mask is not None:
+            mask = mask.permute(0, 3, 1, 2)
+            depth_dx *= mask[:, :, :, 1:]
+            depth_dy *= mask[:, :, 1:, :]
 
         rgb_dx = torch.mean(rgb.diff(dim=-1), axis=-3, keepdim=True)
         rgb_dy = torch.mean(rgb.diff(dim=-2), axis=-3, keepdim=True)
