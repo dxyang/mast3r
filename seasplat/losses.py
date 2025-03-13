@@ -19,7 +19,6 @@ class SmoothDepthLoss(nn.Module):
 
         # zero out the depth gradients around the mask
         if mask is not None:
-            mask = mask.permute(0, 3, 1, 2)
             depth_dx *= mask[:, :, :, 1:]
             depth_dy *= mask[:, :, 1:, :]
 
