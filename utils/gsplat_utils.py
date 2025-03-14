@@ -34,7 +34,12 @@ class AffineExposureOptModule(torch.nn.Module):
         rgb_render = torch.matmul(rgb_render, exposure[:, :3, :3]) + exposure[:, :, 3].unsqueeze(1).unsqueeze(1)
         rgb_render = rgb_render.clamp(0.0, 1.0)
 
-        return rgb_render
+        info = {
+            "r_dist": torch.norm(exposure[:, :3, :3], p="fro", dim=(1, 2)),
+            "t_dist": torch.norm(exposure[:, :, 3], p=2, dim=1),
+        }
+
+        return rgb_render, info
 
 class CameraOptModule(torch.nn.Module):
     """Camera pose optimization module."""
