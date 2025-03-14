@@ -35,7 +35,7 @@ from gsplat.optimizers import SelectiveAdam
 
 from seasplat.losses import SmoothDepthLoss
 from splat.model import create_splats_with_optimizers, add_new_frame
-from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule
+from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule, CameraOptModule
 from utils.mask import get_yawzi_downward_mask
 @dataclass
 class Config:
@@ -87,11 +87,10 @@ class Config:
     smooth_depth_lambda: float = 2.0
 
     # use isotropic gaussians
-    isotropic: bool = True
+    isotropic: bool = False
 
     exposure_optimization: bool = False
     exposure_lr_init: float = 0.001
-
 
     # debugging
     start_image_idx: int = 0
@@ -149,6 +148,16 @@ class Config:
     depth_loss: bool = False
     # Weight for depth loss
     depth_lambda: float = 1e-2
+
+    # Enable camera optimization.
+    pose_opt: bool = False
+    # Learning rate for camera optimization
+    pose_opt_lr: float = 1e-5
+    # Regularization for camera optimization as weight decay
+    pose_opt_reg: float = 1e-6
+    # Add noise to camera extrinsics. This is only to test the camera pose optimization.
+    pose_noise: float = 0.0
+
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -260,6 +269,19 @@ class Runner:
                 )
             ]
             print(f"Exposure optimization enabled for {len(self.trainset)} cameras")
+
+        self.pose_optimizers = []
+        if cfg.pose_opt:
+            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+            self.pose_adjust.zero_init()
+            self.pose_optimizers = [
+                torch.optim.Adam(
+                    self.pose_adjust.parameters(),
+                    lr=cfg.pose_opt_lr,
+                    weight_decay=cfg.pose_opt_reg,
+                )
+            ]
+            print(f"Pose optimization enabled for {len(self.trainset)} cameras")
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -382,6 +404,13 @@ class Runner:
                     self.exposure_optimizers[0], gamma=0.01 ** (1.0 / self.max_steps)
                 )
             )
+        if cfg.pose_opt:
+            # pose optimization has a learning rate schedule
+            self.schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / self.max_steps)
+                )
+            )
 
         # Iterative training loop
         self.global_tic = time.time()
@@ -413,20 +442,17 @@ class Runner:
                 self.splat_optimization(pbar, cfg.full_splat_opt_steps, [i for i in range(idx)])
 
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
-        print(f"Saving model")
-
-        data = {"step": self.global_step, "splats": self.splats.state_dict()}
-        torch.save(
-            data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
-        )
+        self.save_model()
         self.render_traj(self.global_step)
-        print(f"Optimizing the whole scene for {self.max_steps - self.global_step} steps")
-        self.splat_optimization(pbar, self.max_steps - self.global_step + 1, [i for i in range(len(self.trainset))])
 
-        data = {"step": self.global_step, "splats": self.splats.state_dict()}
-        torch.save(
-            data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
-        )
+        remaining_steps = self.max_steps - self.global_step
+        print(f"Optimizing the whole scene for {remaining_steps} steps")
+        pbar = tqdm.tqdm(range(remaining_steps))
+        all_idxs = [i for i in range(len(self.trainset))]
+        for _ in pbar:
+            self.splat_optimization(pbar, 1, all_idxs)
+
+        self.save_model()
         self.render_traj(self.global_step)
 
     def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False):
@@ -454,6 +480,10 @@ class Runner:
                 depths_gt = data["depths"].to(self.device).unsqueeze(0)  # [1, M]
 
             height, width = pixels.shape[1:3]
+
+            if cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+
             sh_degree_to_use = cfg.sh_degree
 
             # forward pass
@@ -479,7 +509,7 @@ class Runner:
                 colors = colors + bkgd * (1.0 - alphas)
 
             if cfg.exposure_optimization:
-                colors = self.exposure(colors, torch.from_numpy(np.array([dset_idx])).to(self.device))
+                colors, exposure_info = self.exposure(colors, torch.from_numpy(np.array([dset_idx])).to(self.device))
 
             # strategy pre backward
             self.cfg.strategy.step_pre_backward(
@@ -533,6 +563,13 @@ class Runner:
             desc = f"loss={loss.item():.3f}| " f"num gs: {len(self.splats['means'])}| " f"step={self.global_step}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if cfg.pose_opt:
+                # monitor the pose error
+                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                desc += f"pose err={pose_err.item():.6f}| "
+            if cfg.exposure_optimization:
+                desc += f"expo rot={exposure_info['r_dist'].item():.6f}| "
+                desc += f"expo t={exposure_info['t_dist'].item():.6f}| "
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and self.global_step % cfg.tb_every == 0:
@@ -544,6 +581,12 @@ class Runner:
                     self.writer.add_scalar("train/smoothdepthloss", smooth_depth_loss.item(), self.global_step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), self.global_step)
                 self.writer.add_scalar("train/mem", mem, self.global_step)
+                self.writer.add_scalar("train/time", time.time() - self.global_tic, self.global_step)
+                if cfg.exposure_optimization:
+                    self.writer.add_scalar("train/expo_rot", exposure_info["r_dist"].item(), self.global_step)
+                    self.writer.add_scalar("train/expo_t", exposure_info["t_dist"].item(), self.global_step)
+                if cfg.pose_opt:
+                    self.writer.add_scalar("train/pose_opt", pose_err.item(), self.global_step)
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), self.global_step)
                 if cfg.tb_save_image:
@@ -554,22 +597,7 @@ class Runner:
 
             # save checkpoint before updating the model
             if self.global_step in [i - 1 for i in cfg.save_steps] or self.global_step == self.max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - self.global_tic,
-                    "num_GS": len(self.splats["means"]),
-                }
-                print("Step: ", self.global_step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{self.global_step:04d}_rank0.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
-                data = {"step": self.global_step, "splats": self.splats.state_dict()}
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
-                )
+                self.save_model()
 
             if cfg.visible_adam:
                 gaussian_cnt = self.splats.means.shape[0]
@@ -583,6 +611,9 @@ class Runner:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.exposure_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for scheduler in self.schedulers:
@@ -624,6 +655,28 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(self.global_step, num_train_rays_per_step)
 
+    def save_model(self):
+        mem = torch.cuda.max_memory_allocated() / 1024**3
+        stats = {
+            "mem": mem,
+            "ellipse_time": time.time() - self.global_tic,
+            "num_GS": len(self.splats["means"]),
+        }
+        print("Step: ", self.global_step, stats)
+        with open(
+            f"{self.stats_dir}/train_step{self.global_step:08d}_rank0.json",
+            "w",
+        ) as f:
+            json.dump(stats, f)
+
+        data = {"step": self.global_step, "splats": self.splats.state_dict()}
+        if self.cfg.exposure_optimization:
+            data["exposure_opt"] = self.exposure.state_dict()
+        if self.cfg.pose_opt:
+            data["pose_adjust"] = self.pose_adjust.state_dict()
+        torch.save(
+            data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
+        )
 
     @torch.no_grad()
     def _viewer_render_fn(
@@ -760,7 +813,7 @@ if __name__ == "__main__":
                 visible_adam=True,
                 num_init_images=10,
                 num_init_steps=500,
-                num_add_steps=50,
+                num_add_steps=10,
                 sliding_window=5,
                 max_steps=500_000,
                 save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000],
@@ -792,6 +845,8 @@ if __name__ == "__main__":
     now = datetime.now()
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
+
+    import pdb; pdb.set_trace()
 
     runner = Runner(0, 0, 1, cfg)
 
