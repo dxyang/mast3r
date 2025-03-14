@@ -127,7 +127,6 @@ def add_new_frame(
 ):
     device = rgb_image.device
     is_isotropic = not params["quats"].requires_grad
-    assert is_isotropic
     use_sh = "shN" in params
     init_opacity = 0.1
     init_scale = 1.0

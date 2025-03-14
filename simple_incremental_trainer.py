@@ -846,8 +846,6 @@ if __name__ == "__main__":
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
 
-    import pdb; pdb.set_trace()
-
     runner = Runner(0, 0, 1, cfg)
 
     if cfg.ckpt is not None:
