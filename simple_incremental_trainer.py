@@ -668,8 +668,8 @@ if __name__ == "__main__":
                 strategy=DefaultStrategy(
                     verbose=True,
                     grow_grad2d=0.0002, #0.0008,
-                    grow_scale3d=0.01 / 10.0, # / 15.0,
-                    prune_scale3d=0.1 / 10.0, # / 15.0,
+                    grow_scale3d=0.01, # / 15.0,
+                    prune_scale3d=0.1, # / 15.0,
                     refine_start_iter = 250, # probably similar to num_init_steps
                     refine_stop_iter = 500_000,
                     reset_every = 250, # this is not used / commented out /shrug
