@@ -246,6 +246,7 @@ class Runner:
                 rgb=sfm_init_colors,
                 visible_adam=cfg.visible_adam,
                 isotropic=cfg.isotropic,
+                scene_scale=self.scene_scale,
             )
         elif cfg.init_type == "random":
             self.splats, self.optimizers = create_splats_with_optimizers(
@@ -254,6 +255,7 @@ class Runner:
                 init_extent=cfg.init_extent,
                 visible_adam=cfg.visible_adam,
                 isotropic=cfg.isotropic,
+                scene_scale=self.scene_scale,
             )
         else:
             assert False
