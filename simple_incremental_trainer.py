@@ -473,7 +473,7 @@ class Runner:
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(self.device).unsqueeze(0)
+            image_ids = data["image_id"].to(self.device)
             masks = data["mask"].to(self.device).unsqueeze(0) if "mask" in data else None  # [1, H, W]
             if cfg.depth_loss:
                 points = data["points"].to(self.device).unsqueeze(0)  # [1, M, 2]
