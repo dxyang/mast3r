@@ -35,6 +35,7 @@ class Parser:
         factor: int = 1,
         normalize: bool = False,
         test_every: int = 8,
+        center_crop: bool = False, # adjust camera K to center crop (so 1/2 resolution)
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -53,6 +54,10 @@ class Parser:
         manager.load_cameras()
         manager.load_images()
         manager.load_points3D()
+
+        # HACK
+        if center_crop:
+            assert factor == 2, "Only support 2x center crop"
 
         # Extract extrinsic matrices in world-to-camera format.
         imdata = manager.images
@@ -78,7 +83,13 @@ class Parser:
             cam = manager.cameras[camera_id]
             fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
+            if center_crop:
+                assert cx == cam.width // factor, "Only support center crop for now"
+                assert cy == cam.height // factor, "Only support center crop for now"
+                K[0, 2] -= cam.width // (factor * 2)
+                K[1, 2] -= cam.height // (factor * 2)
+            else:
+                K[:2, :] /= factor
             Ks_dict[camera_id] = K
 
             # Get distortion parameters.
@@ -150,7 +161,9 @@ class Parser:
             self.bounds = np.load(posefile)[:, -2:]
 
         # Load images.
-        if factor > 1 and not self.extconf["no_factor_suffix"]:
+        if center_crop:
+            image_dir_suffix = "_cc"
+        elif factor > 1 and not self.extconf["no_factor_suffix"]:
             image_dir_suffix = f"_{factor}"
         else:
             image_dir_suffix = ""
@@ -217,6 +230,7 @@ class Parser:
         actual_height, actual_width = actual_image.shape[:2]
         colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
         s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
+
         for camera_id, K in self.Ks_dict.items():
             K[0, :] *= s_width
             K[1, :] *= s_height
@@ -462,15 +476,21 @@ if __name__ == "__main__":
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--data_dir", type=str, default="data/360_v2/garden")
     argparser.add_argument("--factor", type=int, default=2)
+    argparser.add_argument("--center_crop", action='store_true')
     argparser.add_argument("--test_every", type=int, default=1e6) # don't have any images in the test
     args = argparser.parse_args()
 
     # Parse COLMAP data.
     parser = Parser(
-        data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=args.test_every
+        data_dir=args.data_dir,
+        factor=args.factor,
+        normalize=False,
+        test_every=args.test_every,
+        center_crop=args.center_crop
     )
     dataset = Dataset(parser, split="all", load_depths=False)
     print(f"Dataset: {len(dataset)} images.")
+    import pdb; pdb.set_trace()
     for idx, data in enumerate(tqdm.tqdm(dataset)):
         if args.factor == 2:
             try:

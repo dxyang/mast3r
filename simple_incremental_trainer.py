@@ -67,6 +67,9 @@ class Config:
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
+    # take the center crop of the image (should use with factor 2)
+    center_crop: bool = False
+
     # incremental relevant parameters
     # number of initial images to use for initialization
     num_init_images: int = 10
@@ -217,6 +220,7 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            center_crop=cfg.center_crop,
         )
         self.trainset = Dataset(
             self.parser,
@@ -450,6 +454,7 @@ class Runner:
         remaining_steps = self.max_steps - self.global_step
         print(f"Optimizing the whole scene for {remaining_steps} steps")
         pbar = tqdm.tqdm(range(remaining_steps))
+        import pdb; pdb.set_trace()
         all_idxs = [i for i in range(len(self.trainset))]
         for _ in pbar:
             self.splat_optimization(pbar, 1, all_idxs)
@@ -553,7 +558,7 @@ class Runner:
 
             if cfg.smooth_depth_loss:
                 smooth_depth_loss = self.smooth_depth_criterion(
-                    colors.permute(0, 3, 1, 2),
+                    pixels.permute(0, 3, 1, 2),
                     depths.permute(0, 3, 1, 2),
                     mask=self.robo_mask.permute(0, 3, 1, 2) if cfg.apply_robo_mask else None
                 )
