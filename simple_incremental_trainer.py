@@ -95,6 +95,9 @@ class Config:
     exposure_optimization: bool = False
     exposure_lr_init: float = 0.001
 
+    # modify the default strategy
+    do_opacity_reset: bool = False
+
     # debugging
     start_image_idx: int = 0
     num_total_images: int = 1e10
@@ -445,6 +448,9 @@ class Runner:
             self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
 
             if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
+                # samples cameras based on spatial distribution
+
+                print(f"Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
                 self.splat_optimization(pbar, cfg.full_splat_opt_steps, [i for i in range(idx)])
 
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
@@ -806,27 +812,14 @@ if __name__ == "__main__":
             Config(
                 strategy=DefaultStrategy(
                     verbose=True,
-                    grow_grad2d=0.0002, #0.0008,
-                    grow_scale3d=0.01, # / 15.0,
-                    prune_scale3d=0.1, # / 15.0,
-                    refine_start_iter = 250, # probably similar to num_init_steps
-                    refine_stop_iter = 500_000,
-                    reset_every = 250, # this is not used / commented out /shrug
-                    refine_every = 100, # probably similar to num_add_steps,
-                    absgrad=False, # if absgrad is True, should set grow_grad2d = 0.0008
-                    revised_opacity=False, # default False
-                    do_opacity_reset=False,
                 ),
                 visible_adam=True,
                 num_init_images=10,
-                num_init_steps=500,
+                num_init_steps=250,
                 num_add_steps=10,
                 sliding_window=5,
                 max_steps=500_000,
                 save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000],
-                full_splat_opt = False,
-                full_splat_opt_every = 100,
-                full_splat_opt_steps = 100,
                 far_plane=10.0
             ),
         ),
@@ -852,6 +845,8 @@ if __name__ == "__main__":
     now = datetime.now()
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
+
+    cfg.strategy.do_opacity_reset = cfg.do_opacity_reset
 
     runner = Runner(0, 0, 1, cfg)
 
