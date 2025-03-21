@@ -6,6 +6,7 @@ from typing_extensions import assert_never
 import cv2
 import imageio.v2 as imageio
 import numpy as np
+from scipy.stats import gaussian_kde
 import torch
 from pycolmap import SceneManager
 
@@ -424,26 +425,25 @@ class SpatialDataset:
             c2w = self.dataset.parser.camtoworlds[idx]
             xy_world = c2w[:2, 3]
             xy_worlds.append(xy_world)
-        xy_worlds = np.array(xy_worlds)
-        idxs = [i for i in range(len(xy_worlds))]
+        self.xy_worlds = np.array(xy_worlds)
+        idxs = [i for i in range(len(self.xy_worlds))]
 
         if dbg_plot:
             # plot random points
             plot_xys = []
             for _ in range(2000):
                 res = np.random.choice(idxs)
-                plot_xys.append(xy_worlds[res])
+                plot_xys.append(self.xy_worlds[res])
             plot_xys = np.array(plot_xys)
 
             fig = px.scatter(x=plot_xys[:, 0], y=plot_xys[:, 1])
             fig.write_image("z_random.png")
 
         # fit a KDE
-        from scipy.stats import gaussian_kde
-        kde = gaussian_kde(xy_worlds.T)
+        kde = gaussian_kde(self.xy_worlds.T)
 
         # reweight the points
-        weights = 1.0 / kde(xy_worlds.T)
+        weights = 1.0 / kde(self.xy_worlds.T)
         normalized_weights = weights / np.sum(weights)
 
         if dbg_plot:
@@ -451,7 +451,7 @@ class SpatialDataset:
             plot_xys = []
             for _ in range(2000):
                 res = np.random.choice(idxs, p=normalized_weights)
-                plot_xys.append(xy_worlds[res])
+                plot_xys.append(self.xy_worlds[res])
             plot_xys = np.array(plot_xys)
 
             fig = px.scatter(x=plot_xys[:, 0], y=plot_xys[:, 1])
@@ -466,6 +466,16 @@ class SpatialDataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         idx = np.random.choice(self.idxs, p=self.normalized_weights)
         return self.dataset.__getitem__(idx)
+
+    def get_weights_for_subset(self, subset: List[int]) -> np.ndarray:
+        kde = gaussian_kde(self.xy_worlds[subset].T)
+        weights = 1.0 / kde(self.xy_worlds[subset].T)
+        normalized_weights = weights / np.sum(weights)
+        return normalized_weights
+
+    def get_weights_for_full(self):
+        return self.normalized_weights
+
 
 if __name__ == "__main__":
     import argparse
