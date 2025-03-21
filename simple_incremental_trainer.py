@@ -83,6 +83,7 @@ class Config:
     full_splat_opt: bool = False
     full_splat_opt_every: int = 100
     full_splat_opt_steps: int = 1000
+    spatial_sample: bool = False
 
     apply_robo_mask: bool = False
 
@@ -172,26 +173,6 @@ class Config:
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
-    def adjust_steps(self, factor: float):
-        self.eval_steps = [int(i * factor) for i in self.eval_steps]
-        self.save_steps = [int(i * factor) for i in self.save_steps]
-        self.max_steps = int(self.max_steps * factor)
-        self.sh_degree_interval = int(self.sh_degree_interval * factor)
-
-        strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
-            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-            strategy.reset_every = int(strategy.reset_every * factor)
-            strategy.refine_every = int(strategy.refine_every * factor)
-        elif isinstance(strategy, MCMCStrategy):
-            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-            strategy.refine_every = int(strategy.refine_every * factor)
-        else:
-            assert_never(strategy)
-
-
 class Runner:
     """Engine for training and testing."""
 
@@ -231,6 +212,9 @@ class Runner:
             load_depths=True,
         )
         print(f"Dataset length: {len(self.trainset)}")
+
+        # Generate a spatial dataset sampler
+        self.spatial_sampler = SpatialDataset(self.trainset)
 
         # Obtain init pointcloud from parser
         global_pcd_indices = set([])
@@ -448,10 +432,13 @@ class Runner:
             self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
 
             if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
-                # samples cameras based on spatial distribution
-
                 print(f"Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
-                self.splat_optimization(pbar, cfg.full_splat_opt_steps, [i for i in range(idx)])
+                norm_weights = None
+                if cfg.spatial_sample:
+                    norm_weights = self.spatial_sampler.get_weights_for_subset([i for i in range(idx)])
+                self.splat_optimization(
+                    pbar, cfg.full_splat_opt_steps, [i for i in range(idx)], weights=norm_weights
+                )
 
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
         self.save_model()
@@ -459,16 +446,19 @@ class Runner:
 
         remaining_steps = self.max_steps - self.global_step
         print(f"Optimizing the whole scene for {remaining_steps} steps")
-        pbar = tqdm.tqdm(range(remaining_steps))
         import pdb; pdb.set_trace()
+        pbar = tqdm.tqdm(range(remaining_steps))
         all_idxs = [i for i in range(len(self.trainset))]
+        norm_weights = None
+        if cfg.spatial_sample:
+            norm_weights = self.spatial_sampler.get_weights_for_full()
         for _ in pbar:
-            self.splat_optimization(pbar, 1, all_idxs)
+            self.splat_optimization(pbar, 1, all_idxs, weights=norm_weights)
 
         self.save_model()
         self.render_traj(self.global_step)
 
-    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False):
+    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None):
         for step in range(num_steps):
             if not self.cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -476,7 +466,10 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            dset_idx = np.random.choice(select_idxs)
+            if weights is not None:
+                dset_idx = np.random.choice(select_idxs, p=weights)
+            else:
+                dset_idx = np.random.choice(select_idxs)
             data = self.trainset[dset_idx]
 
             # parse data
@@ -811,6 +804,10 @@ if __name__ == "__main__":
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
                 strategy=DefaultStrategy(
+                    refine_start_iter=500,
+                    refine_stop_iter=250_000,
+                    reset_every=3000,
+                    refine_every=100,
                     verbose=True,
                 ),
                 visible_adam=True,
@@ -818,9 +815,9 @@ if __name__ == "__main__":
                 num_init_steps=250,
                 num_add_steps=10,
                 sliding_window=5,
-                max_steps=500_000,
                 save_steps=[7_000, 50_000, 100_000, 150_000, 200_000, 250_000, 300_000, 350_000, 400_000, 450_000, 500_000],
-                far_plane=10.0
+                far_plane=10.0,
+                max_steps=300_000,
             ),
         ),
         "original_default": (
@@ -841,7 +838,6 @@ if __name__ == "__main__":
         ),
     }
     cfg = tyro.extras.overridable_config_cli(configs)
-    cfg.adjust_steps(cfg.steps_scaler)
     now = datetime.now()
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
