@@ -173,6 +173,20 @@ class Config:
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
+    def adjust_steps(self, factor: float):
+        strategy = self.strategy
+        if isinstance(strategy, DefaultStrategy):
+            # strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            # strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.reset_every = int(strategy.reset_every * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, MCMCStrategy):
+            # strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            # strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        else:
+            assert_never(strategy)
+
 class Runner:
     """Engine for training and testing."""
 
@@ -841,9 +855,10 @@ if __name__ == "__main__":
     now = datetime.now()
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
-
     cfg.strategy.do_opacity_reset = cfg.do_opacity_reset
+    cfg.adjust_steps(cfg.steps_scaler)
 
+    print(cfg)
     runner = Runner(0, 0, 1, cfg)
 
     if cfg.ckpt is not None:
