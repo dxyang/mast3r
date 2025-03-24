@@ -37,6 +37,7 @@ class AffineExposureOptModule(torch.nn.Module):
         info = {
             "r_dist": torch.norm(exposure[:, :3, :3], p="fro", dim=(1, 2)),
             "t_dist": torch.norm(exposure[:, :, 3], p=2, dim=1),
+            "l1_with_identity": torch.norm(exposure - torch.eye(3, 4, device=exposure.device), p=1, dim=(1, 2)),
         }
 
         return rgb_render, info

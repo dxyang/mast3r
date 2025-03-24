@@ -285,7 +285,7 @@ class Runner:
                 torch.optim.Adam(
                     self.pose_adjust.parameters(),
                     lr=cfg.pose_opt_lr,
-                    weight_decay=cfg.pose_opt_reg,
+                    # weight_decay=cfg.pose_opt_reg,
                 )
             ]
             print(f"Pose optimization enabled for {len(self.trainset)} cameras")
@@ -590,6 +590,7 @@ class Runner:
             if cfg.exposure_optimization:
                 desc += f"expo rot={exposure_info['r_dist'].item():.6f}| "
                 desc += f"expo t={exposure_info['t_dist'].item():.6f}| "
+                desc += f"expo l1={exposure_info['l1_with_identity'].item():.6f}| "
             pbar.set_description(desc)
 
             if cfg.tb_every > 0 and self.global_step % cfg.tb_every == 0:
@@ -605,6 +606,7 @@ class Runner:
                 if cfg.exposure_optimization:
                     self.writer.add_scalar("train/expo_rot", exposure_info["r_dist"].item(), self.global_step)
                     self.writer.add_scalar("train/expo_t", exposure_info["t_dist"].item(), self.global_step)
+                    self.writer.add_scalar("train/expo_l1", exposure_info["l1_with_identity"].item(), self.global_step)
                 if cfg.pose_opt:
                     self.writer.add_scalar("train/pose_opt", pose_err.item(), self.global_step)
                 if cfg.depth_loss:
