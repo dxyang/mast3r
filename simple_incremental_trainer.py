@@ -457,6 +457,7 @@ class Runner:
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
         self.save_model()
         self.render_traj(self.global_step)
+        torch.cuda.empty_cache()
 
         remaining_steps = self.max_steps - self.global_step
         print(f"Optimizing the whole scene for {remaining_steps} steps")
@@ -471,6 +472,7 @@ class Runner:
 
         self.save_model()
         self.render_traj(self.global_step)
+        torch.cuda.empty_cache()
 
     def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None):
         for step in range(num_steps):
@@ -792,7 +794,6 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
-
 
 if __name__ == "__main__":
     """
