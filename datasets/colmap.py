@@ -174,6 +174,8 @@ class Parser:
             if not os.path.exists(d):
                 raise ValueError(f"Image folder {d} does not exist.")
 
+        self.image_dir = image_dir
+
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
