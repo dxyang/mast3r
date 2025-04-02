@@ -5,3 +5,6 @@
 [submodule "gsplat"]
 	path = gsplat
 	url = git@github.com:nerfstudio-project/gsplat.git
+[submodule "Depth-Anything-V2"]
+	path = Depth-Anything-V2
+	url = git@github.com:DepthAnything/Depth-Anything-V2.git
