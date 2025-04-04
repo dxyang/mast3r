@@ -374,6 +374,7 @@ class Dataset:
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
+            "image_fp": self.parser.image_paths[index],
             "image_id": torch.from_numpy(np.array([item])).int(),  # the index of the image in the dataset
         }
         if mask is not None:
@@ -385,6 +386,7 @@ class Dataset:
             image_name = self.parser.image_names[index]
             point_indices = self.parser.point_indices[image_name]
             points_world = self.parser.points[point_indices]
+            points_errs = self.parser.points_err[point_indices] # (M,)
             points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
             points_proj = (K @ points_cam.T).T
             points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
@@ -401,6 +403,7 @@ class Dataset:
             depths = depths[selector]
             point_indices = point_indices[selector]
             data["points"] = torch.from_numpy(points).float()
+            data["points_errs"] = torch.from_numpy(points_errs).float()
             data["depths"] = torch.from_numpy(depths).float()
             data["points_rgb"] = torch.from_numpy(self.parser.points_rgb[point_indices]).float()
             data["points_xyz"] = torch.from_numpy(self.parser.points[point_indices]).float()
