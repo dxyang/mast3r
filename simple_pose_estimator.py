@@ -168,7 +168,7 @@ def estimate_camera_pose(
 
 if __name__ == "__main__":
     # functions
-    estimate_pose = False
+    estimate_pose = True
     render_images = True
 
     # arguments
@@ -178,8 +178,10 @@ if __name__ == "__main__":
     test_every = 1e8
     center_crop = True
 
-    start_offset = 5
+    start_offset = 1
+    num_opt_iter = 500
     print(f"Starting pose estimation at offset {start_offset}")
+    print(f"Number of optimization iterations: {num_opt_iter}")
     skip_save_img = True
 
     model_path = Path("/srv/warplab/dxy/mast3r_experiments/03242025/yawzi_ss_hgs_params_10x_re100_poseopt1e4/ckpts/ckpt_300000_rank0.pt")
@@ -187,12 +189,13 @@ if __name__ == "__main__":
     # output
     exp_path = model_path.parent.parent
     output_dir = exp_path / "pose_estimate"
-    img_output_dir = output_dir / f"image_hats_{start_offset}"
+    img_output_dir = output_dir / f"image_hats_{start_offset}_{num_opt_iter}"
     if not os.path.exists(img_output_dir):
         os.makedirs(img_output_dir, exist_ok=True)
-    output_fp = output_dir / f"pose_estimate_{start_offset}_data.pkl"
+    output_fp = output_dir / f"pose_estimate_{start_offset}_{num_opt_iter}_data.pkl"
 
     # load the model
+    # TODO: make the splats not require_grad?
     splat_data = load_splats(str(model_path))
     splats = splat_data["splats"]
 
@@ -233,7 +236,7 @@ if __name__ == "__main__":
             K = data["K"].to(device) # 3x3
 
             # estimate the camera pose
-            T_world_camEstimate, recon_loss, rgb_hat = estimate_camera_pose(rgb_image, K, T_world_camInit, splats=splats, do_expo_opt=False)
+            T_world_camEstimate, recon_loss, rgb_hat = estimate_camera_pose(rgb_image, K, T_world_camInit, splats=splats, max_iter=num_opt_iter, do_expo_opt=False)
 
             # calculate l2 distance of translation error
             t_error = torch.norm(T_world_camEstimate[:3, 3] - T_world_camGt[:3, 3], p=2)
