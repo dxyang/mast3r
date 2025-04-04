@@ -1,6 +1,7 @@
 {
     "python.analysis.extraPaths": [
         "./dust3r",
-        "./gsplat"
+        "./gsplat",
+        "./Depth-Anything-V2"
     ]
 }
