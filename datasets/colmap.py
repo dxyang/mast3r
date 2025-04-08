@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import json
 from typing import Any, Dict, List, Optional
 from typing_extensions import assert_never
@@ -9,6 +10,10 @@ import numpy as np
 from scipy.stats import gaussian_kde
 import torch
 from pycolmap import SceneManager
+
+from utils.depth_image import depth_image_to_pcd
+
+from .dvl_data import DvlDataset
 
 from .normalize import (
     align_principle_axes,
@@ -37,6 +42,7 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         center_crop: bool = False, # adjust camera K to center crop (so 1/2 resolution)
+        monodepth_key: str = "None"
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -180,8 +186,18 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        colmap_to_image = dict(zip(colmap_files, image_files))
-        image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # colmap_to_image = dict(zip(colmap_files, image_files))
+        # image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        # dxy: let's assume the downsampled images have the same name
+        image_paths = [os.path.join(image_dir, f) for f in image_names]
+
+        # monodepth files
+        depth_dir = os.path.join(data_dir, "depth" + image_dir_suffix)
+        depth_dir = os.path.join(depth_dir, monodepth_key)
+        if os.path.exists(depth_dir):
+            print(f"Have access to monodepth from {depth_dir}")
+            self.monodepth_dir = depth_dir
+            self.monodepth_paths = [os.path.join(depth_dir, f"{Path(f).stem}.npy") for f in image_names] # List[str], (num_images,)
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -326,6 +342,8 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_monodepths: bool = False,
+        use_dvl_data: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -339,6 +357,16 @@ class Dataset:
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
 
+        self.load_monodepths = load_monodepths
+        self.use_dvl_data = use_dvl_data
+        if load_monodepths:
+            assert hasattr(self.parser, "monodepth_paths"), "Monodepth paths not found"
+            assert len(self.parser.monodepth_paths) == len(self.parser.image_paths), "Monodepth paths not found"
+            print(f"Will be utilizing monodepths like {self.parser.monodepth_paths[0]}")
+
+            if use_dvl_data:
+                self.dvl_dataset = DvlDataset("/home/dayang/code/mast3r/datasets/dvl_data.csv")
+
     def __len__(self):
         return len(self.indices)
 
@@ -351,7 +379,12 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        # extract ros timestamp of image
+        ros_t_sec, ros_t_ns = self.parser.image_names[index].split('.')[0].split('_')[-1].split('-')
+        ros_ts = int(int(ros_t_sec) * 1e9 + int(ros_t_ns)) # nanoseconds
+
         if len(params) > 0:
+            assert False # "Distorted images are not supported yet."
             # Images are distorted. Undistort them.
             mapx, mapy = (
                 self.parser.mapx_dict[camera_id],
@@ -376,9 +409,27 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "image_fp": self.parser.image_paths[index],
             "image_id": torch.from_numpy(np.array([item])).int(),  # the index of the image in the dataset
+            "ros_ts": ros_ts # nanoseconds as an int
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+
+        if self.load_monodepths:
+            subsample = 100
+
+            # unproject monodepth into pointcloud
+            monodepth = np.load(self.parser.monodepth_paths[index])
+            pcd_wrt_cam = depth_image_to_pcd(monodepth[:, :, None], K) # 3 x N
+
+            if self.use_dvl_data:
+                avg_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
+                scale = avg_range / np.mean(pcd_wrt_cam)
+                pcd_wrt_cam *= scale
+
+            pcd_wrt_world = (camtoworlds[:3, :3] @ pcd_wrt_cam + camtoworlds[:3, 3:4]).T # N x 3
+            pcd_rgb = image.reshape(-1, 3) # N x 3
+            data["md_xyz_wrt_world"] = torch.from_numpy(pcd_wrt_world).float()[::subsample]
+            data["md_rgb"] = torch.from_numpy(pcd_rgb).float()[::subsample]
 
         if self.load_depths:
             # projected points to image plane to get depths
@@ -402,11 +453,11 @@ class Dataset:
             points = points[selector]
             depths = depths[selector]
             point_indices = point_indices[selector]
-            data["points"] = torch.from_numpy(points).float()
+            data["points"] = torch.from_numpy(points).float() # projected onto image plane (?)
             data["points_errs"] = torch.from_numpy(points_errs).float()
             data["depths"] = torch.from_numpy(depths).float()
             data["points_rgb"] = torch.from_numpy(self.parser.points_rgb[point_indices]).float()
-            data["points_xyz"] = torch.from_numpy(self.parser.points[point_indices]).float()
+            data["points_xyz"] = torch.from_numpy(self.parser.points[point_indices]).float() # wrt world
             data["point_indices"] = point_indices.tolist()
 
         return data
@@ -501,10 +552,12 @@ if __name__ == "__main__":
         factor=args.factor,
         normalize=False,
         test_every=args.test_every,
-        center_crop=args.center_crop
+        center_crop=args.center_crop,
+        use_optimized_monodepth=True
     )
-    dataset = Dataset(parser, split="all", load_depths=False)
+    dataset = Dataset(parser, split="all", load_depths=False, load_monodepths=True)
     print(f"Dataset: {len(dataset)} images.")
+    test = dataset[0]
     import pdb; pdb.set_trace()
     for idx, data in enumerate(tqdm.tqdm(dataset)):
         if args.factor == 2:
