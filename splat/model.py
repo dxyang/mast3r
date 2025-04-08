@@ -117,7 +117,7 @@ def initialize_first_timestep():
     pass
 
 def add_new_frame(
-    rgb_image: torch.Tensor = None,         # uint8, HWC
+    rgb_image: torch.Tensor = None,         # uint8, HWC, I guess this isn't really used but to check the device lol
     pcd_points: torch.Tensor = None,        # N x 3, float
     pcd_rgb: torch.Tensor = None,           # N x 3, uint8
     T_world_camera: torch.Tensor = None,    # 4 x 4, float
