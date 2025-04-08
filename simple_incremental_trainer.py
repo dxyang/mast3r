@@ -127,6 +127,9 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
+    # use monodepth pointcloud instead of sfm pointcloud
+    monodepth_key: str = "None" # raw, optimized, optimized_dvl, raw_dvl
+
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
@@ -219,26 +222,42 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             center_crop=cfg.center_crop,
+            monodepth_key=cfg.monodepth_key,
         )
         self.trainset = Dataset(
             self.parser,
             split="all",
             load_depths=True,
+            load_monodepths=cfg.monodepth_key != "None",
+            use_dvl_data=cfg.monodepth_key == "raw_dvl"
         )
         print(f"Dataset length: {len(self.trainset)}")
 
         # Generate a spatial dataset sampler
         self.spatial_sampler = SpatialDataset(self.trainset)
 
-        # Obtain init pointcloud from parser
-        global_pcd_indices = set([])
-        for idx in range(cfg.num_init_images):
-            data = self.trainset[cfg.start_image_idx + idx]
-            global_pcd_indices = global_pcd_indices.union(data["point_indices"])
-        global_pcd_indices = list(global_pcd_indices)
+        # monodepth related
+        if cfg.monodepth_key == "None":
+            # Obtain init pointcloud from parser
+            global_pcd_indices = set([])
+            for idx in range(cfg.num_init_images):
+                data = self.trainset[cfg.start_image_idx + idx]
+                global_pcd_indices = global_pcd_indices.union(data["point_indices"])
+            global_pcd_indices = list(global_pcd_indices)
 
-        sfm_init_points = self.parser.points[global_pcd_indices]
-        sfm_init_colors = self.parser.points_rgb[global_pcd_indices]
+            init_points = self.parser.points[global_pcd_indices]
+            init_colors = self.parser.points_rgb[global_pcd_indices]
+        else:
+            # Obtain init pointcloud from monodepth
+            pcd_xyz = []
+            pcd_rgb = []
+            for idx in range(cfg.num_init_images):
+                data = self.trainset[cfg.start_image_idx + idx]
+                pcd_xyz.append(data["md_xyz_wrt_world"])
+                pcd_rgb.append(data["md_rgb"])
+
+            init_points = torch.cat(pcd_xyz, dim=0).numpy()
+            init_colors = torch.cat(pcd_rgb, dim=0).numpy()
 
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
@@ -247,8 +266,8 @@ class Runner:
         if cfg.init_type == "sfm":
             self.splats, self.optimizers = create_splats_with_optimizers(
                 init_type=cfg.init_type,
-                points=sfm_init_points,
-                rgb=sfm_init_colors,
+                points=init_points,
+                rgb=init_colors,
                 visible_adam=cfg.visible_adam,
                 isotropic=cfg.isotropic,
                 scene_scale=self.scene_scale,
@@ -434,15 +453,27 @@ class Runner:
 
             # add a new image to the gaussian model
             data = self.trainset[idx]
-            add_new_frame(
-                rgb_image=data["image"].to(self.device),
-                pcd_points=data["points_xyz"].to(self.device),
-                pcd_rgb=data["points_rgb"].to(self.device),
-                T_world_camera=data["camtoworld"].to(self.device),
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-            )
+            if cfg.monodepth_key == "None":
+                add_new_frame(
+                    rgb_image=data["image"].to(self.device),
+                    pcd_points=data["points_xyz"].to(self.device),
+                    pcd_rgb=data["points_rgb"].to(self.device),
+                    T_world_camera=data["camtoworld"].to(self.device),
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                )
+            else:
+                add_new_frame(
+                    rgb_image=data["image"].to(self.device),
+                    pcd_points=data["md_xyz_wrt_world"].to(self.device),
+                    pcd_rgb=data["md_rgb"].to(self.device),
+                    T_world_camera=data["camtoworld"].to(self.device),
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                )
+
             self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
 
             if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
