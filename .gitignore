@@ -1,6 +1,5 @@
 checkpoints/
 experiments
-*.csv
 *.html
 asmk/
 *.ply

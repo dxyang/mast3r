@@ -344,6 +344,8 @@ class Dataset:
         load_depths: bool = False,
         load_monodepths: bool = False,
         use_dvl_data: bool = False,
+        use_odom_csv: bool = False,
+        use_apriltag_csv: bool = False
     ):
         self.parser = parser
         self.split = split
@@ -367,21 +369,54 @@ class Dataset:
             if use_dvl_data:
                 self.dvl_dataset = DvlDataset("/home/dayang/code/mast3r/datasets/dvl_data.csv")
 
+        # get the timestamps of the images
+        self.ros_ts_list = []
+        for image_name in self.parser.image_names:
+            ros_t_sec, ros_t_ns = image_name.split('.')[0].split('_')[-1].split('-')
+            ros_ts = int(int(ros_t_sec) * 1e9 + int(ros_t_ns)) # nanoseconds
+            self.ros_ts_list.append(ros_ts)
+        self.ros_ts_list = np.array(self.ros_ts_list)
+
+        self.use_odom_csv = use_odom_csv
+        if use_odom_csv:
+            from utils.csv_odom import read_csv_odom, slerp_closets_odomcam, K_T_COLMAPWORLD_GTSAMWORLD
+            csv_odom_fp = "/home/dayang/code/mast3r/datasets/02212025_compare_trajectories.csv"
+            T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(csv_odom_fp)
+            odom_timestamps = (odom_timestamps * 1e9).astype(np.int64) # nanoseconds
+            koi = "optimized_odom_visodom_tag"
+            T_gtsamWorld_odomCams = slerp_closets_odomcam(self.ros_ts_list, odom_timestamps, T_world_gtsamCams_dict[koi])
+            self.T_world_odomCams = [K_T_COLMAPWORLD_GTSAMWORLD @ T_gtsamWorld_odomCam for T_gtsamWorld_odomCam in T_gtsamWorld_odomCams]
+
+        self.use_apriltag_csv = use_apriltag_csv
+        self.apriltag_seen_idxs = []
+        if self.use_apriltag_csv:
+            from utils.csv_odom import read_csv_apriltag
+            apriltag_csv_fp = "/home/dayang/code/mast3r/datasets/04102025_tag_poses.csv"
+            T_cam_apriltags, apriltag_timestamps_s = read_csv_apriltag(apriltag_csv_fp)
+            apriltag_timestamp_ns = (apriltag_timestamps_s * 1e9).astype(np.int64) # nanoseconds
+            for idx, ros_ts_ns in enumerate(self.ros_ts_list):
+                if ros_ts_ns in apriltag_timestamp_ns:
+                    self.apriltag_seen_idxs.append(idx)
+
     def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
+        assert index == item # I think is the same always lol
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
+        camtoworlds = self.parser.camtoworlds[index] # 4x4
         mask = self.parser.mask_dict[camera_id]
 
+        # if we're using odom cams, overwrite T_world_cam
+        if self.use_odom_csv:
+            camtoworlds = self.T_world_odomCams[item].numpy()
+
         # extract ros timestamp of image
-        ros_t_sec, ros_t_ns = self.parser.image_names[index].split('.')[0].split('_')[-1].split('-')
-        ros_ts = int(int(ros_t_sec) * 1e9 + int(ros_t_ns)) # nanoseconds
+        ros_ts = self.ros_ts_list[item]
 
         if len(params) > 0:
             assert False # "Distorted images are not supported yet."
@@ -422,7 +457,7 @@ class Dataset:
             pcd_wrt_cam = depth_image_to_pcd(monodepth[:, :, None], K) # 3 x N
 
             if self.use_dvl_data:
-                avg_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
+                avg_range, stddev_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
                 scale = avg_range / np.mean(pcd_wrt_cam)
                 pcd_wrt_cam *= scale
 
@@ -553,9 +588,16 @@ if __name__ == "__main__":
         normalize=False,
         test_every=args.test_every,
         center_crop=args.center_crop,
-        use_optimized_monodepth=True
+        monodepth_key="None"
     )
-    dataset = Dataset(parser, split="all", load_depths=False, load_monodepths=True)
+    dataset = Dataset(
+        parser,
+        split="all",
+        load_depths=False,
+        load_monodepths=False,
+        use_odom_csv=True,
+        use_apriltag_csv=True
+    )
     print(f"Dataset: {len(dataset)} images.")
     test = dataset[0]
     import pdb; pdb.set_trace()
