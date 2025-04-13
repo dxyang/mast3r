@@ -398,8 +398,14 @@ class Dataset:
                 if ros_ts_ns in apriltag_timestamp_ns:
                     self.apriltag_seen_idxs.append(idx)
 
+        self.updated_poses = {}
+
     def __len__(self):
         return len(self.indices)
+
+    def update_T_world_cam(self, idx: int, T_world_cam: np.ndarray):
+        """Update the T_world_cam for a specific index."""
+        self.updated_poses[idx] = T_world_cam # 4x4 array
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
@@ -414,6 +420,10 @@ class Dataset:
         # if we're using odom cams, overwrite T_world_cam
         if self.use_odom_csv:
             camtoworlds = self.T_world_odomCams[item].numpy()
+
+        # if an updated pose has been provided for this camera, use that
+        if item in self.updated_poses:
+            camtoworlds = self.updated_poses[item]
 
         # extract ros timestamp of image
         ros_ts = self.ros_ts_list[item]
