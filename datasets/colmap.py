@@ -11,6 +11,7 @@ from scipy.stats import gaussian_kde
 import torch
 from pycolmap import SceneManager
 
+from utils.csv_odom import read_csv_apriltag, read_csv_odom, slerp_closets_odomcam, K_T_COLMAPWORLD_GTSAMWORLD
 from utils.depth_image import depth_image_to_pcd
 
 from .dvl_data import DvlDataset
@@ -367,7 +368,8 @@ class Dataset:
             print(f"Will be utilizing monodepths like {self.parser.monodepth_paths[0]}")
 
             if use_dvl_data:
-                self.dvl_dataset = DvlDataset("/home/dayang/code/mast3r/datasets/dvl_data.csv")
+                dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
+                self.dvl_dataset = DvlDataset(str(dir_path / "dvl_data.csv"))
 
         # get the timestamps of the images
         self.ros_ts_list = []
@@ -379,8 +381,8 @@ class Dataset:
 
         self.use_odom_csv = use_odom_csv
         if use_odom_csv:
-            from utils.csv_odom import read_csv_odom, slerp_closets_odomcam, K_T_COLMAPWORLD_GTSAMWORLD
-            csv_odom_fp = "/home/dayang/code/mast3r/datasets/02212025_compare_trajectories.csv"
+            dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
+            csv_odom_fp = str(dir_path / "02212025_compare_trajectories.csv")
             T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(csv_odom_fp)
             odom_timestamps = (odom_timestamps * 1e9).astype(np.int64) # nanoseconds
             koi = "optimized_odom_visodom_tag"
@@ -390,8 +392,8 @@ class Dataset:
         self.use_apriltag_csv = use_apriltag_csv
         self.apriltag_seen_idxs = []
         if self.use_apriltag_csv:
-            from utils.csv_odom import read_csv_apriltag
-            apriltag_csv_fp = "/home/dayang/code/mast3r/datasets/04102025_tag_poses.csv"
+            dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
+            apriltag_csv_fp = str(dir_path / "04102025_tag_poses.csv")
             T_cam_apriltags, apriltag_timestamps_s = read_csv_apriltag(apriltag_csv_fp)
             apriltag_timestamp_ns = (apriltag_timestamps_s * 1e9).astype(np.int64) # nanoseconds
             for idx, ros_ts_ns in enumerate(self.ros_ts_list):

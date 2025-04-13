@@ -212,6 +212,8 @@ if __name__ == "__main__":
     '''
     most of the code below sanity checks transforming between metashape and colmap
     '''
+    import os
+    from pathlib import Path
 
     from datasets.colmap import Parser, Dataset
     from utils.plotly_viz_utils import PlotlyScene, plot_points_sequence, plot_transform
@@ -221,8 +223,9 @@ if __name__ == "__main__":
     center_crop = True
     test_every = 1e10
 
-    csv_odom_fp = "/home/dayang/code/mast3r/datasets/02212025_compare_trajectories.csv"
-    apriltag_csv_fp = "/home/dayang/code/mast3r/datasets/04102025_tag_poses.csv"
+    dataset_file_dir_path = Path(os.path.dirname(os.path.realpath(__file__))).parent / "datasets"
+    csv_odom_fp = str(dataset_file_dir_path / "/02212025_compare_trajectories.csv")
+    apriltag_csv_fp = str(dataset_file_dir_path / "04102025_tag_poses.csv")
 
     # Parse CSV odom data
     T_world_gtsamCams_dict, odom_timestamps = read_csv_odom(csv_odom_fp)
@@ -356,8 +359,6 @@ if __name__ == "__main__":
         plot_transform(pcd_scene.figure, T_world_cam.cpu().numpy(), label=f"camSeesTag_{idx}", linelength=0.1, linewidth=10)
     for idx, T_world_tag in enumerate(T_colmapWorld_tagSeens):
         plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"seenTag_{idx}", linelength=0.1, linewidth=10)
-
-
 
     pcd_scene.plot_scene_to_html(f"TEST2_pointclouds_gtsam_colmap")
 
