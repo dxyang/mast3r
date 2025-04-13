@@ -52,8 +52,11 @@ class CameraOptModule(torch.nn.Module):
         # Identity rotation in 6D representation
         self.register_buffer("identity", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]))
 
-    def zero_init(self):
-        torch.nn.init.zeros_(self.embeds.weight)
+    def zero_init(self, idx: int = None):
+        if idx is not None:
+            torch.nn.init.zeros_(self.embeds.weight[idx])
+        else:
+            torch.nn.init.zeros_(self.embeds.weight)
 
     def random_init(self, std: float):
         torch.nn.init.normal_(self.embeds.weight, std=std)
