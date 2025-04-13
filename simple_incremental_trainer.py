@@ -492,7 +492,7 @@ class Runner:
 
 
 
-                T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=100, do_expo_opt=False)
+                T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=50, do_expo_opt=False)
 
                 save_image(rgb_image.permute(2, 0, 1) / 255.0, f"test_apriltag_init/rgb/rgb_{str(idx).zfill(6)}.png")
                 save_image(rgb_hat.permute(2, 0, 1), f"test_apriltag_init/rgb_hat/rgb_hat_{str(idx).zfill(6)}.png")
@@ -535,7 +535,7 @@ class Runner:
                 T_world_camCurrent = data["camtoworld"].to(device) # 4x4
                 K = data["K"].to(device) # 3x3
 
-                T_world_camEstimate, _, _, _ = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=100, do_expo_opt=False, alpha_threshold=0.99)
+                T_world_camEstimate, _, _, _ = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=10, do_expo_opt=False, alpha_threshold=0.99)
                 self.trainset.update_T_world_cam(idx, T_world_camEstimate.cpu().numpy())
                 self.pose_adjust.zero_init(idx)
 
