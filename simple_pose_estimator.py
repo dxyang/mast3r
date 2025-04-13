@@ -91,7 +91,8 @@ def estimate_camera_pose(
     splats: torch.nn.ParameterDict,
     do_expo_opt: bool = False,
     max_iter: int = 100,
-    dbg: bool = False
+    dbg: bool = False,
+    alpha_threshold: float = 0.0,
 ) -> Tensor:
     # Initialize the camera optimization module with the initial guess
     cam_opt_module = CameraOptModule(1).to(device)
@@ -103,7 +104,7 @@ def estimate_camera_pose(
         expo_optimizer = torch.optim.Adam(exposure_opt_module.parameters(), lr=1e-3)
 
     # Define the optimizer
-    pose_optimizer = torch.optim.Adam(cam_opt_module.parameters(), lr=1e-2)
+    pose_optimizer = torch.optim.Adam(cam_opt_module.parameters(), lr=1e-4)
 
     # Define the loss function
     criterion = torch.nn.L1Loss()
@@ -128,7 +129,7 @@ def estimate_camera_pose(
         T_world_cam = cam_opt_module(T_world_camInit.unsqueeze(0), image_id)
 
         # Render the scene with the current camera pose
-        renders, _, _ = rasterize_splats(
+        renders, alphas, info = rasterize_splats(
             splats=splats,
             camtoworlds=T_world_cam,
             Ks=Ks,
@@ -145,7 +146,10 @@ def estimate_camera_pose(
             colors, depths = renders, None
 
         # Compute the loss between the rendered image and the input image
-        loss = criterion(colors, rgb_01_batch)
+        # only on pixels above some alpha confidence threshold (if 0.0, use all pixels)
+        masked_colors = torch.where(alphas >= alpha_threshold, colors, 0.0)
+        masked_rgb = torch.where(alphas >= alpha_threshold, rgb_01_batch, 0.0)
+        loss = criterion(masked_colors, masked_rgb)
 
         # Backpropagate the loss and update the camera pose
         loss.backward()
@@ -157,13 +161,13 @@ def estimate_camera_pose(
         # save_image(colors.permute(0, 3, 1, 2), dbg / f"img_{iter}.png")
 
         # logging
-        desc = f"loss={loss.item():.3f} "
         if dbg:
+            desc = f"loss={loss.item():.3f} "
             pbar.set_description(desc)
 
     # Return the refined camera pose
     T_world_cam = cam_opt_module(T_world_camInit.unsqueeze(0), image_id)
-    return T_world_cam.detach().squeeze(), loss.item(), colors.detach().squeeze()
+    return T_world_cam.detach().squeeze(), loss.item(), colors.detach().squeeze(), alphas[0].detach()
 
 
 if __name__ == "__main__":
@@ -236,7 +240,7 @@ if __name__ == "__main__":
             K = data["K"].to(device) # 3x3
 
             # estimate the camera pose
-            T_world_camEstimate, recon_loss, rgb_hat = estimate_camera_pose(rgb_image, K, T_world_camInit, splats=splats, max_iter=num_opt_iter, do_expo_opt=False)
+            T_world_camEstimate, recon_loss, rgb_hat, alpha_hat = estimate_camera_pose(rgb_image, K, T_world_camInit, splats=splats, max_iter=num_opt_iter, do_expo_opt=False)
 
             # calculate l2 distance of translation error
             t_error = torch.norm(T_world_camEstimate[:3, 3] - T_world_camGt[:3, 3], p=2)

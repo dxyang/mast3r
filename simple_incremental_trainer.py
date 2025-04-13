@@ -25,6 +25,7 @@ from datasets.traj import (
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchvision.utils import save_image
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
@@ -33,7 +34,10 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
+
+
 from seasplat.losses import SmoothDepthLoss
+from simple_pose_estimator import estimate_camera_pose
 from splat.model import create_splats_with_optimizers, add_new_frame
 from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule, CameraOptModule
 from utils.mask import get_yawzi_downward_mask
@@ -128,7 +132,13 @@ class Config:
     ssim_lambda: float = 0.2
 
     # use monodepth pointcloud instead of sfm pointcloud
-    monodepth_key: str = "None" # raw, optimized, optimized_dvl, raw_dvl
+    monodepth_key: str = "None" # raw, optimized_sfm_og, optimized_dvl
+    use_dvl_data: bool = False
+
+    use_odom_csv: bool = False
+    use_apriltag_csv: bool = False
+    do_apriltag_init: bool = False
+    fit_pose_before_adding: bool = False
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -229,30 +239,42 @@ class Runner:
             split="all",
             load_depths=True,
             load_monodepths=cfg.monodepth_key != "None",
-            use_dvl_data=cfg.monodepth_key == "raw_dvl"
+            use_dvl_data=cfg.use_dvl_data,
+            use_odom_csv=cfg.use_odom_csv,
+            use_apriltag_csv=cfg.use_apriltag_csv,
         )
         print(f"Dataset length: {len(self.trainset)}")
 
         # Generate a spatial dataset sampler
         self.spatial_sampler = SpatialDataset(self.trainset)
 
+        # Init with apriltag visible poses or first n images
+        if cfg.do_apriltag_init:
+            assert cfg.use_apriltag_csv
+            self.init_idxs = self.trainset.apriltag_seen_idxs[:49]
+            # self.init_idxs = self.trainset.apriltag_seen_idxs
+        else:
+            self.init_idxs = np.arange(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)
+
         # monodepth related
         if cfg.monodepth_key == "None":
-            # Obtain init pointcloud from parser
+            # Obtain init pointcloud from sfm
             global_pcd_indices = set([])
-            for idx in range(cfg.num_init_images):
-                data = self.trainset[cfg.start_image_idx + idx]
+            for idx in self.init_idxs:
+                data = self.trainset[idx]
                 global_pcd_indices = global_pcd_indices.union(data["point_indices"])
             global_pcd_indices = list(global_pcd_indices)
 
             init_points = self.parser.points[global_pcd_indices]
             init_colors = self.parser.points_rgb[global_pcd_indices]
+            # init_points = self.parser.points
+            # init_colors = self.parser.points_rgb
         else:
             # Obtain init pointcloud from monodepth
             pcd_xyz = []
             pcd_rgb = []
-            for idx in range(cfg.num_init_images):
-                data = self.trainset[cfg.start_image_idx + idx]
+            for idx in self.init_idxs:
+                data = self.trainset[idx]
                 pcd_xyz.append(data["md_xyz_wrt_world"])
                 pcd_rgb.append(data["md_rgb"])
 
@@ -438,31 +460,101 @@ class Runner:
                 )
             )
 
+        # import pdb; pdb.set_trace() # this is what the initialization point cloud looks like
+
         # Iterative training loop
         self.global_tic = time.time()
         self.global_step = 0
         pbar = tqdm.tqdm(range(len(self.trainset)))
+
+        '''
+        apriltag initialization of splat model
+        * just use a handful of poses near the apriltag that we trust to build the initial model
+        '''
+        if cfg.do_apriltag_init:
+            # build an initial not horrible model
+            self.splat_optimization(pbar, 3_000, self.init_idxs)
+            self.cfg.strategy.reset_opacity(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+            )
+            self.splat_optimization(pbar, 1_000, self.init_idxs)
+
+            # estimate all the camera poses
+            T_world_camInits = []
+            T_world_camEstimates = []
+            for idx in self.init_idxs:
+                data = self.trainset[idx]
+                rgb_image = data["image"].to(device) # HWC
+                T_world_camCurrent = data["camtoworld"].to(device) # 4x4
+                K = data["K"].to(device) # 3x3
+
+
+
+                T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=100, do_expo_opt=False)
+
+                save_image(rgb_image.permute(2, 0, 1) / 255.0, f"test_apriltag_init/rgb/rgb_{str(idx).zfill(6)}.png")
+                save_image(rgb_hat.permute(2, 0, 1), f"test_apriltag_init/rgb_hat/rgb_hat_{str(idx).zfill(6)}.png")
+                save_image(alpha_hat.permute(2, 0, 1), f"test_apriltag_init/alpha/alpha_hat_{str(idx).zfill(6)}.png")
+
+                T_world_camInits.append(T_world_camCurrent)
+                T_world_camEstimates.append(T_world_camEstimate)
+
+            # update the camera poses
+            if cfg.pose_opt:
+                for cam_idx, T_world_cam, T_world_camInit in zip(self.init_idxs, T_world_camEstimates, T_world_camInits):
+                    self.trainset.update_T_world_cam(cam_idx, T_world_cam.cpu().numpy())
+                    self.pose_adjust.zero_init(cam_idx)
+
+            # update the model again
+            self.cfg.strategy.reset_opacity(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+            )
+            self.splat_optimization(pbar, 1_000, self.init_idxs)
+
         for idx in pbar:
-            if idx < cfg.start_image_idx + cfg.num_init_images:
-                continue
-            elif idx == cfg.start_image_idx + cfg.num_init_images:
-                self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
-            elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
-                print(f"Reached {cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images} images, stopping training")
-                break
+            if cfg.do_apriltag_init:
+                if idx < 2: # skip the first two images
+                    continue
+            else:
+                if idx < cfg.start_image_idx + cfg.num_init_images:
+                    continue
+                elif idx == cfg.start_image_idx + cfg.num_init_images:
+                    self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
+                elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
+                    print(f"Reached {cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images} images, stopping training")
+                    break
+
+            # see if the camera can be better fitted to the splat
+            if cfg.fit_pose_before_adding:
+                data = self.trainset[idx]
+                rgb_image = data["image"].to(device) # HWC
+                T_world_camCurrent = data["camtoworld"].to(device) # 4x4
+                K = data["K"].to(device) # 3x3
+
+                T_world_camEstimate, _, _, _ = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=100, do_expo_opt=False, alpha_threshold=0.99)
+                self.trainset.update_T_world_cam(idx, T_world_camEstimate.cpu().numpy())
+                self.pose_adjust.zero_init(idx)
 
             # add a new image to the gaussian model
             data = self.trainset[idx]
             if cfg.monodepth_key == "None":
-                add_new_frame(
-                    rgb_image=data["image"].to(self.device),
-                    pcd_points=data["points_xyz"].to(self.device),
-                    pcd_rgb=data["points_rgb"].to(self.device),
-                    T_world_camera=data["camtoworld"].to(self.device),
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                )
+                if data["points_xyz"].shape[0] <= 2:
+                    # don't add points if not any points are seen
+                    pass
+                else:
+                    add_new_frame(
+                        rgb_image=data["image"].to(self.device),
+                        pcd_points=data["points_xyz"].to(self.device),
+                        pcd_rgb=data["points_rgb"].to(self.device),
+                        T_world_camera=data["camtoworld"].to(self.device),
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                    )
             else:
                 add_new_frame(
                     rgb_image=data["image"].to(self.device),
@@ -474,9 +566,16 @@ class Runner:
                     state=self.strategy_state,
                 )
 
-            self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(idx - cfg.sliding_window + 1, idx + 1)])
+            self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(max(idx - cfg.sliding_window + 1, 0), idx + 1)])
 
             if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
+                print(f"Opacity reset")
+                self.cfg.strategy.reset_opacity(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                )
+
                 print(f"Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
                 norm_weights = None
                 if cfg.spatial_sample:
