@@ -108,6 +108,64 @@ def create_splats_with_optimizers(
     }
     return splats, optimizers
 
+
+def load_splats_with_optimizers(
+    model_path: str,
+    scene_scale: float = 1.0,
+    sh_degree: int = 0,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    batch_size: int = 1,
+    device: str = "cuda",
+    isotropic: bool = False,
+):
+    '''
+    load the splats and optimizers from a checkpoint
+    '''
+    data = torch.load(model_path)
+    loaded_splats = data["splats"]
+
+    params = [
+        # name, value, lr
+        ("means", torch.nn.Parameter(loaded_splats["means"]), 1.6e-4 * scene_scale),
+        ("scales", torch.nn.Parameter(loaded_splats["scales"]), 5e-3),
+        ("opacities", torch.nn.Parameter(loaded_splats["opacities"]), 5e-2),
+    ]
+    if isotropic:
+        params.append(("quats", torch.nn.Parameter(loaded_splats["quats"], requires_grad=False), 1e-3))
+    else:
+        params.append(("quats", torch.nn.Parameter(loaded_splats["quats"]), 1e-3))
+
+    params.append(("sh0", torch.nn.Parameter(loaded_splats["sh0"]), 2.5e-3))
+    if sh_degree > 0:
+        assert "shN" in loaded_splats
+        params.append(("shN", torch.nn.Parameter(loaded_splats["shN"]), 2.5e-3 / 20))
+
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+    # Scale learning rate based on batch size, reference:
+    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
+    # Note that this would not make the training exactly equivalent, see
+    # https://arxiv.org/pdf/2402.18824v1
+    BS = batch_size
+    optimizer_class = None
+    if sparse_grad:
+        optimizer_class = torch.optim.SparseAdam
+    elif visible_adam:
+        optimizer_class = SelectiveAdam
+    else:
+        optimizer_class = torch.optim.Adam
+    optimizers = {
+        name: optimizer_class(
+            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
+            eps=1e-15 / math.sqrt(BS),
+            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
+            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        )
+        for name, v, lr in params if v.requires_grad
+    }
+
+    return splats, optimizers
+
 def initialize_first_timestep():
     '''
     given a few images, initialize the splats?
@@ -185,3 +243,8 @@ def add_new_frame(
     for k, v in state.items():
         if isinstance(v, torch.Tensor):
             state[k] = torch.cat((v, torch.zeros(N, device=device)))
+
+
+if __name__ == "__main__":
+    model_path = "/home/dayang/code/mast3r/experiments/04142025/justapriltag/ckpts/ckpt_141380_rank0.pt"
+    load_splats_with_optimizers(model_path, scene_scale=53.0, sh_degree=0, visible_adam=True, isotropic=True)
