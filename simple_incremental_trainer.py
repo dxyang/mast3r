@@ -15,13 +15,10 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
+import viser.transforms
 import yaml
-from datasets.colmap import Dataset, Parser, SpatialDataset
-from datasets.traj import (
-    generate_interpolated_path,
-    generate_ellipse_path_z,
-    generate_spiral_path,
-)
+
+from scipy.spatial.transform import Rotation as R
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -34,11 +31,15 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
-
-
+from datasets.colmap import Dataset, Parser, SpatialDataset
+from datasets.traj import (
+    generate_interpolated_path,
+    generate_ellipse_path_z,
+    generate_spiral_path,
+)
 from seasplat.losses import SmoothDepthLoss
 from simple_pose_estimator import estimate_camera_pose
-from splat.model import create_splats_with_optimizers, add_new_frame
+from splat.model import create_splats_with_optimizers, add_new_frame, load_splats_with_optimizers
 from utils.gsplat_utils import set_random_seed, seed_worker, AffineExposureOptModule, CameraOptModule
 from utils.mask import get_yawzi_downward_mask
 @dataclass
@@ -131,13 +132,18 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
+    load_ckpt_fp: str = "None"
+
     # use monodepth pointcloud instead of sfm pointcloud
     monodepth_key: str = "None" # raw, optimized_sfm_og, optimized_dvl
     use_dvl_data: bool = False
 
     use_odom_csv: bool = False
+
     use_apriltag_csv: bool = False
-    do_apriltag_init: bool = False
+    do_apriltag_init: bool = False               # use the first 49 apriltag images
+    use_all_apriltag_images_first: bool = False  # use the first 49 apriltag images then optimized all of them together
+
     fit_pose_before_adding: bool = False
 
     # Near plane clipping distance
@@ -245,6 +251,12 @@ class Runner:
         )
         print(f"Dataset length: {len(self.trainset)}")
 
+        # Some values from the dataset to cache (H, W, K)
+        K = self.trainset[0]["K"]
+        rgb_image = self.trainset[0]["image"] / 255.0
+        self.H, self.W = rgb_image.shape[0], rgb_image.shape[1]
+        self.fx, self.fy = K[0, 0].item(), K[1, 1].item()
+
         # Generate a spatial dataset sampler
         self.spatial_sampler = SpatialDataset(self.trainset)
 
@@ -303,9 +315,16 @@ class Runner:
                 isotropic=cfg.isotropic,
                 scene_scale=self.scene_scale,
             )
+        elif cfg.init_type == "full_model" or cfg.init_type == "partial_model":
+            self.splats, self.optimizers = load_splats_with_optimizers(
+                model_path=cfg.load_ckpt_fp,
+                visible_adam=cfg.visible_adam,
+                isotropic=cfg.isotropic,
+                scene_scale=self.scene_scale,
+            )
         else:
             assert False
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        print(f"Model initialized with {cfg.init_type}. Number of GS:", len(self.splats["means"]))
 
         self.exposure_optimizers = []
         if cfg.exposure_optimization:
@@ -472,6 +491,10 @@ class Runner:
         * just use a handful of poses near the apriltag that we trust to build the initial model
         '''
         if cfg.do_apriltag_init:
+            # visualize the cameras in the scene
+            for idx in self.init_idxs:
+                self.add_camera_frame_frustum(idx)
+
             # build an initial not horrible model
             self.splat_optimization(pbar, 3_000, self.init_idxs)
             self.cfg.strategy.reset_opacity(
@@ -482,30 +505,9 @@ class Runner:
             self.splat_optimization(pbar, 1_000, self.init_idxs)
 
             # estimate all the camera poses
-            T_world_camInits = []
-            T_world_camEstimates = []
-            for idx in self.init_idxs:
-                data = self.trainset[idx]
-                rgb_image = data["image"].to(device) # HWC
-                T_world_camCurrent = data["camtoworld"].to(device) # 4x4
-                K = data["K"].to(device) # 3x3
-
-
-
-                T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=50, do_expo_opt=False)
-
-                save_image(rgb_image.permute(2, 0, 1) / 255.0, f"test_apriltag_init/rgb/rgb_{str(idx).zfill(6)}.png")
-                save_image(rgb_hat.permute(2, 0, 1), f"test_apriltag_init/rgb_hat/rgb_hat_{str(idx).zfill(6)}.png")
-                save_image(alpha_hat.permute(2, 0, 1), f"test_apriltag_init/alpha/alpha_hat_{str(idx).zfill(6)}.png")
-
-                T_world_camInits.append(T_world_camCurrent)
-                T_world_camEstimates.append(T_world_camEstimate)
-
-            # update the camera poses
-            if cfg.pose_opt:
-                for cam_idx, T_world_cam, T_world_camInit in zip(self.init_idxs, T_world_camEstimates, T_world_camInits):
-                    self.trainset.update_T_world_cam(cam_idx, T_world_cam.cpu().numpy())
-                    self.pose_adjust.zero_init(cam_idx)
+            save_imgs = False
+            for idx in tqdm.tqdm(self.init_idxs[:49]):
+                self.estimate_and_update_camera_pose(idx, iterations=50, save_imgs=save_imgs)
 
             # update the model again
             self.cfg.strategy.reset_opacity(
@@ -515,10 +517,58 @@ class Runner:
             )
             self.splat_optimization(pbar, 1_000, self.init_idxs)
 
+            if cfg.use_all_apriltag_images_first:
+                # iterate through remaining apriltag poses and incorporate with a lot of opacity resets to get rid of floaters
+                for other_idx, idx in enumerate(tqdm.tqdm(self.trainset.apriltag_seen_idxs)):
+                    if other_idx < 49:
+                        continue
+
+                    # add cam frame and frustum
+                    self.add_camera_frame_frustum(idx)
+
+                    # fit cam to splat
+                    self.estimate_and_update_camera_pose(idx, iterations=50)
+
+                    # update splat
+                    sliding_window_idxs = self.trainset.apriltag_seen_idxs[other_idx - cfg.sliding_window: other_idx + 1]
+                    self.splat_optimization(pbar, cfg.num_add_steps, sliding_window_idxs)
+
+                    # "full" splat opt
+                    if other_idx % 5 == 0:
+                        self.cfg.strategy.reset_opacity(
+                            params=self.splats,
+                            optimizers=self.optimizers,
+                            state=self.strategy_state,
+                        )
+                        update_idxs = self.trainset.apriltag_seen_idxs[:other_idx + 1]
+                        self.splat_optimization(pbar, 500, update_idxs)
+
+        '''
+        starting with a model that has been partially optimized (e.g. with just apriltag middle poses)
+        or with all poses (e.g. something blurry but full scene)
+        '''
+        if cfg.init_type == "partial_model" or cfg.init_type == "full_model":
+            if cfg.init_type == "partial_model":
+                idxs_of_interest = self.trainset.apriltag_seen_idxs[:49]
+            else:
+                idxs_of_interest = [i for i in range(len(self.trainset))]
+
+            # add cameras to the scene
+            for idx in idxs_of_interest:
+                data = self.trainset[idx]
+
+                # visualize the cameras
+                self.add_camera_frame_frustum(idx)
+
+                # estimate and update all the camera poses
+                self.estimate_and_update_camera_pose(idx)
+
         for idx in pbar:
             if cfg.do_apriltag_init:
                 if idx < 2: # skip the first two images
                     continue
+            elif cfg.init_type == "partial_model" or cfg.init_type == "full_model":
+                pass
             else:
                 if idx < cfg.start_image_idx + cfg.num_init_images:
                     continue
@@ -530,31 +580,20 @@ class Runner:
 
             # see if the camera can be better fitted to the splat
             if cfg.fit_pose_before_adding:
-                data = self.trainset[idx]
-                rgb_image = data["image"].to(device) # HWC
-                T_world_camCurrent = data["camtoworld"].to(device) # 4x4
-                K = data["K"].to(device) # 3x3
-
-                T_world_camEstimate, _, _, _ = estimate_camera_pose(rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=10, do_expo_opt=False, alpha_threshold=0.99)
-                self.trainset.update_T_world_cam(idx, T_world_camEstimate.cpu().numpy())
-                self.pose_adjust.zero_init(idx)
+                self.estimate_and_update_camera_pose(idx, 10)
 
             # add a new image to the gaussian model
             data = self.trainset[idx]
             if cfg.monodepth_key == "None":
-                if data["points_xyz"].shape[0] <= 2:
-                    # don't add points if not any points are seen
-                    pass
-                else:
-                    add_new_frame(
-                        rgb_image=data["image"].to(self.device),
-                        pcd_points=data["points_xyz"].to(self.device),
-                        pcd_rgb=data["points_rgb"].to(self.device),
-                        T_world_camera=data["camtoworld"].to(self.device),
-                        params=self.splats,
-                        optimizers=self.optimizers,
-                        state=self.strategy_state,
-                    )
+                add_new_frame(
+                    rgb_image=data["image"].to(self.device),
+                    pcd_points=data["points_xyz"].to(self.device),
+                    pcd_rgb=data["points_rgb"].to(self.device),
+                    T_world_camera=data["camtoworld"].to(self.device),
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                )
             else:
                 add_new_frame(
                     rgb_image=data["image"].to(self.device),
@@ -568,6 +607,7 @@ class Runner:
 
             self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(max(idx - cfg.sliding_window + 1, 0), idx + 1)])
 
+
             if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
                 print(f"Opacity reset")
                 self.cfg.strategy.reset_opacity(
@@ -578,11 +618,18 @@ class Runner:
 
                 print(f"Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
                 norm_weights = None
+                update_idxs = [i for i in range(idx)]
+                if cfg.do_apriltag_init:
+                    update_idxs = list(set(update_idxs + self.init_idxs))
                 if cfg.spatial_sample:
-                    norm_weights = self.spatial_sampler.get_weights_for_subset([i for i in range(idx)])
+                    norm_weights = self.spatial_sampler.get_weights_for_subset(update_idxs)
                 self.splat_optimization(
-                    pbar, cfg.full_splat_opt_steps, [i for i in range(idx)], weights=norm_weights
+                    pbar, cfg.full_splat_opt_steps, update_idxs, weights=norm_weights
                 )
+
+                print(f"Fitting cameras poses for whole scene")
+                for cam_idx in update_idxs:
+                    self.estimate_and_update_camera_pose(cam_idx, iterations=50)
 
         print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
         self.save_model()
@@ -603,6 +650,63 @@ class Runner:
         self.save_model()
         self.render_traj(self.global_step)
         torch.cuda.empty_cache()
+
+    def add_camera_frame_frustum(self, trainset_idx):
+        data = self.trainset[trainset_idx]
+        image_num = data['image_id'].item()
+        assert image_num == trainset_idx
+
+        T_world_cam = data["camtoworld"].numpy()
+        rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
+        pos_xyz = T_world_cam[:3, 3]
+
+        self.server.scene.add_frame(
+            name=f"/cameras/{str(trainset_idx).zfill(6)}",
+            wxyz=rot_wxyz,
+            position=pos_xyz,
+            axes_length=0.1,
+            axes_radius=0.005,
+        )
+        self.server.scene.add_camera_frustum(
+            name=f"/cameras/{str(trainset_idx).zfill(6)}/frustum",
+            fov=2 * np.arctan2(self.H / 2, self.fy),
+            aspect=self.W / self.H,
+            scale=0.15,
+        )
+
+    def estimate_and_update_camera_pose(self, trainset_idx, iterations=50, save_imgs=False):
+        '''
+        fit camera pose to the splat model, update pose in appropriate places including visualizer
+        '''
+        # get data
+        data = self.trainset[trainset_idx]
+        image_num = data['image_id'].item()
+        assert image_num == trainset_idx
+
+        rgb_image = data["image"].to(self.device) # HWC
+        T_world_camCurrent = data["camtoworld"].to(self.device) # 4x4
+        K = data["K"].to(self.device) # 3x3
+
+        with torch.no_grad():
+            if cfg.pose_opt:
+                T_world_camCurrent = self.pose_adjust(T_world_camCurrent.unsqueeze(0), trainset_idx)[0].detach()
+
+        # estimate camera pose
+        # T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(
+        T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(
+            rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=iterations, do_expo_opt=False,
+            scene=self.server.scene, scene_str=f"/cameras/{str(trainset_idx).zfill(6)}"
+        )
+
+        if save_imgs:
+            save_image(rgb_image.permute(2, 0, 1) / 255.0, f"test_apriltag_init/rgb/rgb_{str(trainset_idx).zfill(6)}.png")
+            save_image(rgb_hat.permute(2, 0, 1), f"test_apriltag_init/rgb_hat/rgb_hat_{str(trainset_idx).zfill(6)}.png")
+            save_image(alpha_hat.permute(2, 0, 1), f"test_apriltag_init/alpha/alpha_hat_{str(trainset_idx).zfill(6)}.png")
+
+        # update camera pose
+        self.trainset.update_T_world_cam(trainset_idx, T_world_camEstimate.cpu().numpy())
+        if self.cfg.pose_opt:
+            self.pose_adjust.zero_init(trainset_idx)
 
     def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None):
         for step in range(num_steps):
@@ -795,6 +899,21 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
+            # update camera pose viz
+            with torch.no_grad():
+                if cfg.pose_opt:
+                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                T_world_cam = camtoworlds[0].detach().cpu().numpy()
+                rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
+                pos_xyz = T_world_cam[:3, 3]
+                self.server.scene.add_frame(
+                    name=f"/cameras/{str(dset_idx).zfill(6)}",
+                    wxyz=rot_wxyz,
+                    position=pos_xyz,
+                    axes_length=0.1,
+                    axes_radius=0.005,
+                )
+
             # bookkeeping
             self.global_step += 1
 
@@ -828,6 +947,8 @@ class Runner:
             data["exposure_opt"] = self.exposure.state_dict()
         if self.cfg.pose_opt:
             data["pose_adjust"] = self.pose_adjust.state_dict()
+        data["updated_poses"] = self.trainset.updated_poses
+
         torch.save(
             data, f"{self.ckpt_dir}/ckpt_{self.global_step}_rank0.pt"
         )
