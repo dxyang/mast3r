@@ -4,10 +4,13 @@ import pickle
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 import torch
 from torch import Tensor
 from torchvision.utils import save_image
 from tqdm import tqdm
+
+import viser
 
 from gsplat.rendering import rasterization
 
@@ -93,6 +96,8 @@ def estimate_camera_pose(
     max_iter: int = 100,
     dbg: bool = False,
     alpha_threshold: float = 0.0,
+    scene: viser.SceneApi = None,
+    scene_str: str = None,
 ) -> Tensor:
     # Initialize the camera optimization module with the initial guess
     cam_opt_module = CameraOptModule(1).to(device)
@@ -159,6 +164,20 @@ def estimate_camera_pose(
 
         # dbg = Path("/srv/warplab/dxy/mast3r_experiments/03242025/yawzi_ss_hgs_params_10x_re100_poseopt1e4/pose_estimate/image_hats")
         # save_image(colors.permute(0, 3, 1, 2), dbg / f"img_{iter}.png")
+
+        if scene is not None:
+            # update the scene with the current camera pose
+            with torch.no_grad():
+                T_world_cam = cam_opt_module(T_world_camInit.unsqueeze(0), image_id).squeeze().cpu().numpy()
+                rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
+                pos_xyz = T_world_cam[:3, 3]
+                scene.add_frame(
+                    name=scene_str,
+                    wxyz=rot_wxyz,
+                    position=pos_xyz,
+                    axes_length=0.1,
+                    axes_radius=0.005,
+                )
 
         # logging
         if dbg:
