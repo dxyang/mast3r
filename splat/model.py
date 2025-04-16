@@ -247,4 +247,4 @@ def add_new_frame(
 
 if __name__ == "__main__":
     model_path = "/home/dayang/code/mast3r/experiments/04142025/justapriltag/ckpts/ckpt_141380_rank0.pt"
-    load_splats_with_optimizers(model_path, scene_scale=53.0, sh_degree=0, visible_adam=True, isotropic=True)
+    load_splats_with_optimizers(model_path, scene_scale=53.26284406158799, sh_degree=0, visible_adam=True, isotropic=True)
