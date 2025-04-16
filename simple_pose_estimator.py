@@ -106,7 +106,7 @@ def estimate_camera_pose(
     # Exposure optimization
     if do_expo_opt:
         exposure_opt_module = AffineExposureOptModule(1).to(device)
-        expo_optimizer = torch.optim.Adam(exposure_opt_module.parameters(), lr=1e-3)
+        expo_optimizer = torch.optim.Adam(exposure_opt_module.parameters(), lr=1e-4)
 
     # Define the optimizer
     pose_optimizer = torch.optim.Adam(cam_opt_module.parameters(), lr=1e-4)
