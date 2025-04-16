@@ -85,6 +85,8 @@ class Config:
     # sliding window size for optimizing
     sliding_window: int = 5
 
+    use_every_n: int = 1 # use every n images in splat
+
     full_splat_opt: bool = False
     full_splat_opt_every: int = 100
     full_splat_opt_steps: int = 1000
@@ -392,6 +394,8 @@ class Runner:
         if cfg.apply_robo_mask:
             self.robo_mask = get_yawzi_downward_mask().to(self.device)
 
+        self.cam_frame_added = []
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -547,7 +551,7 @@ class Runner:
         starting with a model that has been partially optimized (e.g. with just apriltag middle poses)
         or with all poses (e.g. something blurry but full scene)
         '''
-        if cfg.init_type == "partial_model" or cfg.init_type == "full_model":
+        if cfg.init_type == "partial_model": #or cfg.init_type == "full_model":
             if cfg.init_type == "partial_model":
                 idxs_of_interest = self.trainset.apriltag_seen_idxs[:49]
             else:
@@ -561,97 +565,157 @@ class Runner:
                 self.add_camera_frame_frustum(idx)
 
                 # estimate and update all the camera poses
-                self.estimate_and_update_camera_pose(idx)
-
-        for idx in pbar:
-            if cfg.do_apriltag_init:
-                if idx < 2: # skip the first two images
-                    continue
-            elif cfg.init_type == "partial_model" or cfg.init_type == "full_model":
-                pass
-            else:
-                if idx < cfg.start_image_idx + cfg.num_init_images:
-                    continue
-                elif idx == cfg.start_image_idx + cfg.num_init_images:
-                    self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
-                elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
-                    print(f"Reached {cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images} images, stopping training")
-                    break
-
-            # see if the camera can be better fitted to the splat
-            if cfg.fit_pose_before_adding:
-                self.estimate_and_update_camera_pose(idx, 10)
-
-            # add a new image to the gaussian model
-            data = self.trainset[idx]
-            if cfg.monodepth_key == "None":
-                add_new_frame(
-                    rgb_image=data["image"].to(self.device),
-                    pcd_points=data["points_xyz"].to(self.device),
-                    pcd_rgb=data["points_rgb"].to(self.device),
-                    T_world_camera=data["camtoworld"].to(self.device),
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                )
-            else:
-                add_new_frame(
-                    rgb_image=data["image"].to(self.device),
-                    pcd_points=data["md_xyz_wrt_world"].to(self.device),
-                    pcd_rgb=data["md_rgb"].to(self.device),
-                    T_world_camera=data["camtoworld"].to(self.device),
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                )
-
-            self.splat_optimization(pbar, cfg.num_add_steps, [i for i in range(max(idx - cfg.sliding_window + 1, 0), idx + 1)])
+                self.estimate_and_update_camera_pose(idx, 250)
 
 
-            if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt:
-                print(f"Opacity reset")
-                self.cfg.strategy.reset_opacity(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                )
 
-                print(f"Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
-                norm_weights = None
-                update_idxs = [i for i in range(idx)]
+        # let's just batch optimized the whole scene
+        if cfg.init_type == "full_model":
+            remaining_steps = self.max_steps - self.global_step
+            print(f"Jumping straight to optimizing the whole scene for {remaining_steps} steps")
+            opt_idxs = [i for i in range(len(self.trainset)) if i % cfg.use_every_n == 0]
+            norm_weights = None
+            if cfg.spatial_sample:
+                norm_weights = self.spatial_sampler.get_weights_for_subset(opt_idxs)
+
+            # self.cfg.strategy.refine_stop_iter = 0
+            self.cfg.strategy.refine_start_iter = 0
+            self.cfg.strategy.refine_every = 100 * 10
+            self.cfg.strategy.reset_every = 3_000 * 3 #10
+            self.cfg.strategy.refine_stop_iter = 15_000 * 10
+            self.cfg.strategy.enable_opacity_reset()
+            self.cfg.strategy.do_opacity_reset = True
+            for i in range(100):
+                if i == 50:
+                    self.cfg.strategy.refine_stop_iter = self.global_step
+                pbar = tqdm.tqdm(range(len(opt_idxs)))
+                for _ in pbar:
+                    self.splat_optimization(pbar, 1, opt_idxs, weights=norm_weights, update_scene_viz=False)
+                # print(f"Opacity reset")
+                # self.cfg.strategy.reset_opacity(
+                #     params=self.splats,
+                #     optimizers=self.optimizers,
+                #     state=self.strategy_state,
+                # )
+
+            import pdb; pdb.set_trace()
+
+            self.save_model()
+            self.render_traj(self.global_step)
+            torch.cuda.empty_cache()
+        else:
+            used_img_idxs = []
+            for idx in pbar:
                 if cfg.do_apriltag_init:
-                    update_idxs = list(set(update_idxs + self.init_idxs))
-                if cfg.spatial_sample:
-                    norm_weights = self.spatial_sampler.get_weights_for_subset(update_idxs)
-                self.splat_optimization(
-                    pbar, cfg.full_splat_opt_steps, update_idxs, weights=norm_weights
-                )
+                    if idx < 2: # skip the first two images
+                        continue
+                elif cfg.init_type == "partial_model":
+                    # ignore until we have "good" apriltag poses to build off of
+                    if idx < 271:
+                        continue
+                elif cfg.init_type == "full_model":
+                    pass
+                else:
+                    if idx < cfg.start_image_idx + cfg.num_init_images:
+                        continue
+                    elif idx == cfg.start_image_idx + cfg.num_init_images:
+                        self.splat_optimization(pbar, cfg.num_init_steps, [i for i in range(cfg.start_image_idx, cfg.start_image_idx + cfg.num_init_images)])
+                    elif idx == cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images:
+                        print(f"Reached {cfg.start_image_idx + cfg.num_init_images + cfg.num_total_images} images, stopping training")
+                        break
 
-                print(f"Fitting cameras poses for whole scene")
-                for cam_idx in update_idxs:
-                    self.estimate_and_update_camera_pose(cam_idx, iterations=50)
+                # down sample images to build model with
+                if idx % cfg.use_every_n != 0:
+                    continue
+                used_img_idxs.append(idx)
 
-        print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
-        self.save_model()
-        self.render_traj(self.global_step)
-        torch.cuda.empty_cache()
+                # add camera frame and frustum to viz
+                self.add_camera_frame_frustum(idx)
 
-        remaining_steps = self.max_steps - self.global_step
-        print(f"Optimizing the whole scene for {remaining_steps} steps")
-        import pdb; pdb.set_trace()
-        pbar = tqdm.tqdm(range(remaining_steps))
-        all_idxs = [i for i in range(len(self.trainset))]
-        norm_weights = None
-        if cfg.spatial_sample:
-            norm_weights = self.spatial_sampler.get_weights_for_full()
-        for _ in pbar:
-            self.splat_optimization(pbar, 1, all_idxs, weights=norm_weights)
+                # see if the camera can be better fitted to the splat
+                if cfg.fit_pose_before_adding:
+                    self.estimate_and_update_camera_pose(idx, 10)
 
-        self.save_model()
-        self.render_traj(self.global_step)
-        torch.cuda.empty_cache()
+                # add a new image to the gaussian model
+                data = self.trainset[idx]
+                if cfg.monodepth_key == "None":
+                    add_new_frame(
+                        rgb_image=data["image"].to(self.device),
+                        pcd_points=data["points_xyz"].to(self.device),
+                        pcd_rgb=data["points_rgb"].to(self.device),
+                        T_world_camera=data["camtoworld"].to(self.device),
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                    )
+                else:
+                    add_new_frame(
+                        rgb_image=data["image"].to(self.device),
+                        pcd_points=data["md_xyz_wrt_world"].to(self.device),
+                        pcd_rgb=data["md_rgb"].to(self.device),
+                        T_world_camera=data["camtoworld"].to(self.device),
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                    )
+
+                opt_idxs = used_img_idxs[max(len(used_img_idxs) - cfg.sliding_window, 0):len(used_img_idxs)]
+                self.splat_optimization(pbar, cfg.num_add_steps, opt_idxs)
+
+                if idx % cfg.full_splat_opt_every == 0 and cfg.full_splat_opt and idx > 0:
+                    print(f"[{idx}] Opacity reset")
+                    self.cfg.strategy.reset_opacity(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                    )
+
+                    print(f"[{idx}] Optimizing the whole scene for {cfg.full_splat_opt_steps} steps")
+                    norm_weights = None
+                    update_idxs = used_img_idxs
+                    if cfg.do_apriltag_init:
+                        update_idxs = list(set(update_idxs + self.init_idxs))
+                    if cfg.init_type == "partial_model":
+                        update_idxs = list(set(update_idxs + self.trainset.apriltag_seen_idxs[:49]))
+                    elif cfg.init_type == "full_model":
+                        pass
+                    if cfg.spatial_sample:
+                        norm_weights = self.spatial_sampler.get_weights_for_subset(update_idxs)
+                    self.splat_optimization(
+                        pbar, cfg.full_splat_opt_steps, update_idxs, weights=norm_weights
+                    )
+
+                    # print(f"[{idx}] Fitting cameras poses for whole scene")
+                    # for cam_idx in update_idxs:
+                    #     self.estimate_and_update_camera_pose(cam_idx, iterations=50)
+
+            print(f"Finished incrementally adding the whole dataset in {self.global_step} steps in {time.time() - self.global_tic} seconds")
+            self.save_model()
+            self.render_traj(self.global_step)
+            torch.cuda.empty_cache()
+
+            remaining_steps = self.max_steps - self.global_step
+            print(f"Optimizing the whole scene for {remaining_steps} steps")
+            import pdb; pdb.set_trace()
+            pbar = tqdm.tqdm(range(remaining_steps))
+            all_idxs = [i for i in range(len(self.trainset))]
+            norm_weights = None
+            if cfg.spatial_sample:
+                norm_weights = self.spatial_sampler.get_weights_for_full()
+            for _ in pbar:
+                self.splat_optimization(pbar, 1, all_idxs, weights=norm_weights)
+
+            self.save_model()
+            self.render_traj(self.global_step)
+            torch.cuda.empty_cache()
 
     def add_camera_frame_frustum(self, trainset_idx):
+        # check if we've already added this camera frame and frustum before
+        if trainset_idx in self.cam_frame_added:
+            return
+
+        self.cam_frame_added.append(trainset_idx)
+
         data = self.trainset[trainset_idx]
         image_num = data['image_id'].item()
         assert image_num == trainset_idx
@@ -688,8 +752,8 @@ class Runner:
         K = data["K"].to(self.device) # 3x3
 
         with torch.no_grad():
-            if cfg.pose_opt:
-                T_world_camCurrent = self.pose_adjust(T_world_camCurrent.unsqueeze(0), trainset_idx)[0].detach()
+            if self.cfg.pose_opt:
+                T_world_camCurrent = self.pose_adjust(T_world_camCurrent.unsqueeze(0), data['image_id'].to(self.device))[0].detach()
 
         # estimate camera pose
         # T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(
@@ -708,7 +772,7 @@ class Runner:
         if self.cfg.pose_opt:
             self.pose_adjust.zero_init(trainset_idx)
 
-    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None):
+    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None, update_scene_viz=True):
         for step in range(num_steps):
             if not self.cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -900,19 +964,20 @@ class Runner:
                 assert_never(self.cfg.strategy)
 
             # update camera pose viz
-            with torch.no_grad():
-                if cfg.pose_opt:
-                    camtoworlds = self.pose_adjust(camtoworlds, image_ids)
-                T_world_cam = camtoworlds[0].detach().cpu().numpy()
-                rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
-                pos_xyz = T_world_cam[:3, 3]
-                self.server.scene.add_frame(
-                    name=f"/cameras/{str(dset_idx).zfill(6)}",
-                    wxyz=rot_wxyz,
-                    position=pos_xyz,
-                    axes_length=0.1,
-                    axes_radius=0.005,
-                )
+            if update_scene_viz:
+                with torch.no_grad():
+                    if cfg.pose_opt:
+                        camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                    T_world_cam = camtoworlds[0].detach().cpu().numpy()
+                    rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
+                    pos_xyz = T_world_cam[:3, 3]
+                    self.server.scene.add_frame(
+                        name=f"/cameras/{str(dset_idx).zfill(6)}",
+                        wxyz=rot_wxyz,
+                        position=pos_xyz,
+                        axes_length=0.1,
+                        axes_radius=0.005,
+                    )
 
             # bookkeeping
             self.global_step += 1
