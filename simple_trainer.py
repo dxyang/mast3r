@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import math
 import os
@@ -30,8 +31,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils.gsplat_utils import CameraOptModule, knn, rgb_to_sh, set_random_seed, seed_worker
 
-from gsplat.compression import PngCompression
-from gsplat.distributed import cli
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
@@ -41,10 +40,9 @@ from seasplat.losses import (
     SmoothDepthLoss,
     GrayWorldPriorLoss,
     RgbSaturationLoss,
-    DarkChannelPriorLossV3,
-    RgbSpatialVariationLoss,
-    AlphaBackgroundLoss
 )
+from utils.mask import get_yawzi_downward_mask
+
 
 @dataclass
 class Config:
@@ -52,8 +50,6 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
-    # Name of compression strategy to use
-    compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
 
@@ -66,8 +62,6 @@ class Config:
     # Every N images there is a test image
     test_every: int = 1e8
 
-    # Random crop size for training  (experimental)
-    patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
@@ -85,8 +79,6 @@ class Config:
 
     # Number of training steps
     max_steps: int = 30_000
-    # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
@@ -97,9 +89,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 3
-    # Turn on another SH degree every this steps
-    sh_degree_interval: int = 1000
+    sh_degree: int = 0
     # Initial opacity of GS
     init_opa: float = 0.1
     # Initial scale of GS
@@ -110,23 +100,24 @@ class Config:
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
-    far_plane: float = 1e10
+    far_plane: float = 10.0
 
     # Strategy for GS densification
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
-    # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
-    packed: bool = False
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
-    # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
+
+    apply_robo_mask: bool = False
+
+    # use isotropic gaussians
+    isotropic: bool = False
 
     # Opacity regularization
     opacity_reg: float = 0.0
@@ -175,10 +166,8 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     def adjust_steps(self, factor: float):
-        self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.max_steps = int(self.max_steps * factor)
-        self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -202,14 +191,12 @@ def create_splats_with_optimizers(
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     scene_scale: float = 1.0,
-    sh_degree: int = 3,
+    sh_degree: int = 0,
     sparse_grad: bool = False,
     visible_adam: bool = False,
     batch_size: int = 1,
-    feature_dim: Optional[int] = None,
     device: str = "cuda",
-    world_rank: int = 0,
-    world_size: int = 1,
+    isotropic: bool = False,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
@@ -223,12 +210,10 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    if isotropic:
+        scales = torch.log(dist_avg * init_scale)  # [N,]
+    else:
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
@@ -242,25 +227,19 @@ def create_splats_with_optimizers(
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
     ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
+    # color is SH coefficients.
+    colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+    colors[:, 0, :] = rgb_to_sh(rgbs)
+    params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), 2.5e-3))
+    if sh_degree > 0:
         params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), 2.5e-3 / 20))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), 2.5e-3))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), 2.5e-3))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
-    BS = batch_size * world_size
+    BS = batch_size
     optimizer_class = None
     if sparse_grad:
         optimizer_class = torch.optim.SparseAdam
@@ -284,15 +263,12 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, local_rank: int, world_rank, world_size: int, cfg: Config
+        self, cfg: Config
     ) -> None:
-        set_random_seed(42 + local_rank)
+        set_random_seed(42)
 
         self.cfg = cfg
-        self.world_rank = world_rank
-        self.local_rank = local_rank
-        self.world_size = world_size
-        self.device = f"cuda:{local_rank}"
+        self.device = f"cuda"
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -317,15 +293,13 @@ class Runner:
         )
         self.trainset = Dataset(
             self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
+            split="all",
             load_depths=cfg.depth_loss,
         )
         if cfg.resample_cams:
             print("Cameras will be sampled based off spatial density!")
             self.trainset = SpatialDataset(self.trainset)
 
-        self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -342,10 +316,8 @@ class Runner:
             sparse_grad=cfg.sparse_grad,
             visible_adam=cfg.visible_adam,
             batch_size=cfg.batch_size,
-            feature_dim=None,
             device=self.device,
-            world_rank=world_rank,
-            world_size=world_size,
+            isotropic=cfg.isotropic
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -371,14 +343,6 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        # Compression Strategy
-        self.compression_method = None
-        if cfg.compression is not None:
-            if cfg.compression == "png":
-                self.compression_method = PngCompression()
-            else:
-                raise ValueError(f"Unknown compression strategy: {cfg.compression}")
-
         self.pose_optimizers = []
         if cfg.pose_opt:
             self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
@@ -390,14 +354,10 @@ class Runner:
                     weight_decay=cfg.pose_opt_reg,
                 )
             ]
-            if world_size > 1:
-                self.pose_adjust = DDP(self.pose_adjust)
 
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
-            if world_size > 1:
-                self.pose_perturb = DDP(self.pose_perturb)
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -428,6 +388,10 @@ class Runner:
                 mode="training",
             )
 
+        # misc
+        if cfg.apply_robo_mask:
+            self.robo_mask = get_yawzi_downward_mask().to(self.device)
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -442,12 +406,19 @@ class Runner:
         # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
+        # makes scales N,3 if isotropic
+        if len(scales.shape) == 1:
+            scales = scales.unsqueeze(1).repeat(1, 3)
+
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
-        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        if "shN" in self.splats:
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+        else:
+            colors = self.splats["sh0"]  # [N, 1, 3]
 
-        rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
+        rasterize_mode = "classic"
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -458,7 +429,7 @@ class Runner:
             Ks=Ks,  # [C, 3, 3]
             width=width,
             height=height,
-            packed=self.cfg.packed,
+            packed=False,
             absgrad=(
                 self.cfg.strategy.absgrad
                 if isinstance(self.cfg.strategy, DefaultStrategy)
@@ -466,7 +437,7 @@ class Runner:
             ),
             sparse_grad=self.cfg.sparse_grad,
             rasterize_mode=rasterize_mode,
-            distributed=self.world_size > 1,
+            distributed=False,
             camera_model=self.cfg.camera_model,
             **kwargs,
         )
@@ -477,13 +448,9 @@ class Runner:
     def train(self):
         cfg = self.cfg
         device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
 
-        # Dump cfg.
-        if world_rank == 0:
-            with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
-                yaml.dump(vars(cfg), f)
+        with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
+            yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
         init_step = 0
@@ -544,13 +511,10 @@ class Runner:
             height, width = pixels.shape[1:3]
 
             if cfg.pose_noise:
-                camtoworlds = self.pose_perturb(camtoworlds, image_ids)
+                camtoworlds = self.pose_perturb(camtoworlds, image_ids[0])
 
             if cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
-
-            # sh schedule
-            sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids[0])
 
             # forward
             renders, alphas, info = self.rasterize_splats(
@@ -558,7 +522,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=sh_degree_to_use,
+                sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
@@ -595,7 +559,10 @@ class Runner:
             )
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
+            if cfg.apply_robo_mask:
+                l1loss = F.l1_loss(colors * self.robo_mask, pixels * self.robo_mask)
+            else:
+                l1loss = F.l1_loss(colors, pixels)
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
@@ -647,7 +614,7 @@ class Runner:
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = f"loss={loss.item():.3f}| " f"sh degree={cfg.sh_degree}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -656,7 +623,7 @@ class Runner:
                 desc += f"pose err={pose_err.item():.6f}| "
             pbar.set_description(desc)
 
-            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+            if cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
@@ -713,44 +680,20 @@ class Runner:
                 }
                 print("Step: ", step, stats)
                 with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
+                    f"{self.stats_dir}/train_step{step:04d}.json",
                     "w",
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
                 if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
+                    data["pose_adjust"] = self.pose_adjust.state_dict()
                 torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                    data, f"{self.ckpt_dir}/ckpt_{step}.pt"
                 )
-
-            # Turn Gradients into Sparse Tensor before running optimizer
-            if cfg.sparse_grad:
-                assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
-                    )
 
             if cfg.visible_adam:
                 gaussian_cnt = self.splats.means.shape[0]
-                if cfg.packed:
-                    visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
-                    )
-                    visibility_mask.scatter_(0, info["gaussian_ids"], 1)
-                else:
-                    visibility_mask = (info["radii"] > 0).any(0)
+                visibility_mask = (info["radii"] > 0).any(0)
 
             # optimize
             for optimizer in self.optimizers.values():
@@ -776,7 +719,7 @@ class Runner:
                     state=self.strategy_state,
                     step=step,
                     info=info,
-                    packed=cfg.packed,
+                    packed=False,
                 )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
@@ -789,10 +732,6 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-
-            # eval the full set
-            if step in [i - 1 for i in cfg.eval_steps]:
-                self.render_traj(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -898,22 +837,6 @@ class Runner:
         )  # [1, H, W, 3]
         return render_colors[0].cpu().numpy()
 
-
-def main(local_rank: int, world_rank, world_size: int, cfg: Config):
-    if world_size > 1 and not cfg.disable_viewer:
-        cfg.disable_viewer = True
-        if world_rank == 0:
-            print("Viewer is disabled in distributed training.")
-
-    runner = Runner(local_rank, world_rank, world_size, cfg)
-
-    runner.train()
-
-    if not cfg.disable_viewer:
-        print("Viewer running... Ctrl+C to exit.")
-        time.sleep(1000000)
-
-
 if __name__ == "__main__":
     """
     Usage:
@@ -925,6 +848,23 @@ if __name__ == "__main__":
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
+    
+    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py mcmc \
+    --exp_name mcmc_scratch \
+    --steps_scaler 10 \
+    --pose_opt
+
+    CUDA_VISIBLE_DEVICES=2 python simple_trainer.py default \
+    --exp_name default_scratch \
+    --steps_scaler 10 \
+    --pose_opt
+
+    CUDA_VISIBLE_DEVICES=3 python simple_trainer.py default \
+    --exp_name default_spatial_scratch \
+    --steps_scaler 3 \
+    --pose_opt --resample_cams
+
+
     """
 
     # Config objects we can choose between.
@@ -933,7 +873,18 @@ if __name__ == "__main__":
         "default": (
             "Gaussian splatting training using densification heuristics from the original paper.",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+                strategy=DefaultStrategy(
+                    refine_start_iter=500,
+                    refine_stop_iter=40_000,
+                    reset_every=3000,
+                    refine_every=100,
+                    grow_grad2d=0.0002,
+                    grow_scale3d=0.001,
+                    prune_scale3d=0.01,
+                    verbose=True
+                ),
+                max_steps=60_000,
+                visible_adam=True,
             ),
         ),
         "mcmc": (
@@ -964,10 +915,15 @@ if __name__ == "__main__":
     cfg = tyro.extras.overridable_config_cli(configs)
     cfg.adjust_steps(cfg.steps_scaler)
 
-    import datetime
-
     now = datetime.now()
     today = now.strftime("%m%d%Y")
     cfg.result_dir = f"experiments/{today}/{cfg.exp_name}"
 
-    cli(main, cfg, verbose=True)
+    print(cfg)
+    runner = Runner(cfg)
+
+    runner.train()
+
+    if not cfg.disable_viewer:
+        print("Viewer running... Ctrl+C to exit.")
+        time.sleep(1000000)
