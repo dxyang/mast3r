@@ -224,7 +224,7 @@ if __name__ == "__main__":
     test_every = 1e10
 
     dataset_file_dir_path = Path(os.path.dirname(os.path.realpath(__file__))).parent / "datasets"
-    csv_odom_fp = str(dataset_file_dir_path / "/02212025_compare_trajectories.csv")
+    csv_odom_fp = str(dataset_file_dir_path / "02212025_compare_trajectories.csv")
     apriltag_csv_fp = str(dataset_file_dir_path / "04102025_tag_poses.csv")
 
     # Parse CSV odom data
@@ -340,26 +340,26 @@ if __name__ == "__main__":
             T_colmapWorld_tagSeens.append(T_colmapWorld_tagSeen)
 
 
-    # Create a viz scene
-    xmin, xmax = -50, 50
-    ymin, ymax = -50, 50
-    zmin, zmax = -50, 50
-    apriltag_scene = PlotlyScene(
-        size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
-    )
-    for idx, T_world_tag in enumerate(T_gtsamWorld_tags[::10]):
-        plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"tag_{idx}", linelength=0.1, linewidth=10)
+    # # Create a viz scene
+    # xmin, xmax = -50, 50
+    # ymin, ymax = -50, 50
+    # zmin, zmax = -50, 50
+    # apriltag_scene = PlotlyScene(
+    #     size=(800, 800), x_range=(xmin, xmax), y_range=(ymin, ymax), z_range=(zmin, zmax)
+    # )
+    # for idx, T_world_tag in enumerate(T_gtsamWorld_tags[::10]):
+    #     plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"tag_{idx}", linelength=0.1, linewidth=10)
     # for idx, T_world_tag in enumerate(T_colmapWorld_tags[::10]):
     #     plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"tag_{idx}", linelength=0.1, linewidth=10)
 
     plot_points_sequence(pcd_scene.figure, odomCamPcd_colmapWorld.T, size=3, name='odomCams')
-    for idx, T_world_cam in enumerate(T_colmapWorld_odomCams[::50]):
-        plot_transform(pcd_scene.figure, T_world_cam.cpu().numpy(), label=f"odomCam{idx}", linelength=0.1, linewidth=10)
-    for idx, T_world_cam in enumerate(T_colmapWorld_odomCamSeesTags):
-        plot_transform(pcd_scene.figure, T_world_cam.cpu().numpy(), label=f"camSeesTag_{idx}", linelength=0.1, linewidth=10)
-    for idx, T_world_tag in enumerate(T_colmapWorld_tagSeens):
-        plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"seenTag_{idx}", linelength=0.1, linewidth=10)
+    # for idx, T_world_cam in enumerate(T_colmapWorld_odomCams[::50]):
+    #     plot_transform(pcd_scene.figure, T_world_cam.cpu().numpy(), label=f"odomCam{idx}", linelength=0.1, linewidth=10)
+    # for idx, T_world_cam in enumerate(T_colmapWorld_odomCamSeesTags):
+    #     plot_transform(pcd_scene.figure, T_world_cam.cpu().numpy(), label=f"camSeesTag_{idx}", linelength=0.1, linewidth=10)
+    # for idx, T_world_tag in enumerate(T_colmapWorld_tagSeens):
+    #     plot_transform(pcd_scene.figure, T_world_tag.cpu().numpy(), label=f"seenTag_{idx}", linelength=0.1, linewidth=10)
 
-    pcd_scene.plot_scene_to_html(f"TEST2_pointclouds_gtsam_colmap")
+    pcd_scene.plot_scene_to_html(f"yawzi_gtsam_metashape_scene")
 
     import pdb; pdb.set_trace()
