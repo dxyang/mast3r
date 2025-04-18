@@ -143,6 +143,8 @@ class Config:
 
     # use monodepth pointcloud instead of sfm pointcloud
     monodepth_key: str = "None" # raw, optimized_sfm_og, optimized_dvl
+
+    # read dvl csv
     use_dvl_data: bool = False
 
     # average depth should be similar to dvl depth
@@ -1044,7 +1046,6 @@ class Runner:
                 loss += cfg.smooth_depth_lambda * smooth_depth_loss
 
             if cfg.dvl_depth_loss:
-                import pdb; pdb.set_trace()
                 dvl_average_range = data["dvl_avg_range"].to(self.device)
                 average_depth = torch.mean(depths)
                 dvl_depth_loss = self.mse_loss(dvl_average_range, average_depth)
