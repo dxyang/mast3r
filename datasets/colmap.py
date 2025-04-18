@@ -346,13 +346,16 @@ class Dataset:
         load_monodepths: bool = False,
         use_dvl_data: bool = False,
         use_odom_csv: bool = False,
-        use_apriltag_csv: bool = False
+        use_apriltag_csv: bool = False,
+        drop_last_150_frames: bool = True
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
+        if drop_last_150_frames:
+            indices = indices[:-150]
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         elif split == "all":
@@ -361,15 +364,15 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every == 0]
 
         self.load_monodepths = load_monodepths
-        self.use_dvl_data = use_dvl_data
         if load_monodepths:
             assert hasattr(self.parser, "monodepth_paths"), "Monodepth paths not found"
             assert len(self.parser.monodepth_paths) == len(self.parser.image_paths), "Monodepth paths not found"
             print(f"Will be utilizing monodepths like {self.parser.monodepth_paths[0]}")
 
-            if use_dvl_data:
-                dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
-                self.dvl_dataset = DvlDataset(str(dir_path / "dvl_data.csv"))
+        self.use_dvl_data = use_dvl_data
+        if use_dvl_data:
+            dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
+            self.dvl_dataset = DvlDataset(str(dir_path / "dvl_data.csv"))
 
         # get the timestamps of the images
         self.ros_ts_list = []
@@ -378,6 +381,8 @@ class Dataset:
             ros_ts = int(int(ros_t_sec) * 1e9 + int(ros_t_ns)) # nanoseconds
             self.ros_ts_list.append(ros_ts)
         self.ros_ts_list = np.array(self.ros_ts_list)
+        if drop_last_150_frames:
+            self.ros_ts_list = self.ros_ts_list[:-150]
 
         self.use_odom_csv = use_odom_csv
         if use_odom_csv:
@@ -461,6 +466,10 @@ class Dataset:
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 
+        if self.use_dvl_data:
+            avg_range, stddev_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
+            data["dvl_avg_range"] = torch.from_numpy(avg_range).float()
+
         if self.load_monodepths:
             subsample = 100
 
@@ -469,7 +478,6 @@ class Dataset:
             pcd_wrt_cam = depth_image_to_pcd(monodepth[:, :, None], K) # 3 x N
 
             if self.use_dvl_data:
-                avg_range, stddev_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
                 scale = avg_range / np.mean(pcd_wrt_cam)
                 pcd_wrt_cam *= scale
 
