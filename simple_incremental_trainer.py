@@ -695,6 +695,7 @@ class Runner:
 
                 # bookkeeping
                 last_dist = dist
+                self.save_model()
         else:
             used_img_idxs = []
             for idx in pbar:
