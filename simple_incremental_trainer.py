@@ -149,7 +149,7 @@ class Config:
 
     # average depth should be similar to dvl depth
     dvl_depth_loss: bool = False
-    dvl_depth_lambda: float = 1e-2
+    dvl_depth_lambda: float = 1e-4
 
     # use gtsam camera poses
     use_odom_csv: bool = False
@@ -590,7 +590,7 @@ class Runner:
 
                 # estimate and update all the camera poses
                 # we can take bigger steps initially since we're confident (?) in the model
-                self.estimate_and_update_camera_pose(idx, 100, lr=1e-3, update_viz=False, visible=False)
+                self.estimate_and_update_camera_pose(idx, 50, lr=1e-3, update_viz=False, visible=False)
 
         # let's just batch optimize the whole scene
         if cfg.init_type == "full_model":
@@ -626,7 +626,7 @@ class Runner:
             import pdb; pdb.set_trace()
 
         elif cfg.sample_from_center:
-            distance_buckets = np.arange(1.0, 13.0, 0.5)
+            distance_buckets = np.arange(1.0, 13.0, 1.0)
             last_dist = 0.0
             num_opt_steps_per_bucket = 10_000
 
@@ -669,7 +669,7 @@ class Runner:
 
                 # optimize
                 pbar = tqdm.tqdm(range(num_opt_steps_per_bucket))
-                cam_fit_iterations = [3500, 7500]
+                cam_fit_iterations = [] #[3500, 7500]
                 for iteration in pbar:
                     self.splat_optimization(
                         pbar, 1, sample_idxs, weights=sample_weights, update_scene_viz=False, visible=False
