@@ -32,11 +32,13 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 
 from datasets.colmap import Dataset, Parser, SpatialDataset
+from datasets.spatial import CsvCenterDataset
 from datasets.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
     generate_spiral_path,
 )
+from gsplat.strategy.ops import remove
 from seasplat.losses import SmoothDepthLoss
 from simple_pose_estimator import estimate_camera_pose
 from splat.model import create_splats_with_optimizers, add_new_frame, load_splats_with_optimizers
@@ -100,6 +102,9 @@ class Config:
     # use isotropic gaussians
     isotropic: bool = False
 
+    # remove gaussians not visible by any camera periodically
+    remove_invisible: bool = False
+
     exposure_optimization: bool = False
     exposure_lr_init: float = 0.001
 
@@ -140,13 +145,23 @@ class Config:
     monodepth_key: str = "None" # raw, optimized_sfm_og, optimized_dvl
     use_dvl_data: bool = False
 
+    # average depth should be similar to dvl depth
+    dvl_depth_loss: bool = False
+    dvl_depth_lambda: float = 1e-2
+
+    # use gtsam camera poses
     use_odom_csv: bool = False
 
+    # use apriltag pose information
     use_apriltag_csv: bool = False
     do_apriltag_init: bool = False               # use the first 49 apriltag images
     use_all_apriltag_images_first: bool = False  # use the first 49 apriltag images then optimized all of them together
 
+    # fit pose to current image before adding points and trying to optimize
     fit_pose_before_adding: bool = False
+
+    # sample images from the center outwards
+    sample_from_center: bool = False
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -380,6 +395,7 @@ class Runner:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
         self.smooth_depth_criterion = SmoothDepthLoss()
+        self.mse_loss = torch.nn.MSELoss()
 
         # Viewer
         if not self.cfg.disable_viewer:
@@ -394,7 +410,10 @@ class Runner:
         if cfg.apply_robo_mask:
             self.robo_mask = get_yawzi_downward_mask().to(self.device)
 
-        self.cam_frame_added = []
+        self.viz_cam_frame_added = []
+
+        if cfg.sample_from_center:
+            self.center_sample_dset = CsvCenterDataset(self.parser)
 
     def rasterize_splats(
         self,
@@ -553,23 +572,25 @@ class Runner:
         '''
         if cfg.init_type == "partial_model": #or cfg.init_type == "full_model":
             if cfg.init_type == "partial_model":
-                idxs_of_interest = self.trainset.apriltag_seen_idxs[:49]
+                # idxs_of_interest = self.trainset.apriltag_seen_idxs[:49]
+                idxs_of_interest = self.trainset.apriltag_seen_idxs
             else:
                 idxs_of_interest = [i for i in range(len(self.trainset))]
 
             # add cameras to the scene
-            for idx in idxs_of_interest:
+            print(f"Fitting {len(idxs_of_interest)} cameras to the initialization model")
+            for idx in tqdm.tqdm(idxs_of_interest):
                 data = self.trainset[idx]
 
                 # visualize the cameras
-                self.add_camera_frame_frustum(idx)
+                # self.add_camera_frame_frustum(idx, visible=False)
+                # self.viz_cam_frame_added.append(idx)
 
                 # estimate and update all the camera poses
-                self.estimate_and_update_camera_pose(idx, 250)
+                # we can take bigger steps initially since we're confident (?) in the model
+                self.estimate_and_update_camera_pose(idx, 100, lr=1e-3, update_viz=False, visible=False)
 
-
-
-        # let's just batch optimized the whole scene
+        # let's just batch optimize the whole scene
         if cfg.init_type == "full_model":
             remaining_steps = self.max_steps - self.global_step
             print(f"Jumping straight to optimizing the whole scene for {remaining_steps} steps")
@@ -597,12 +618,81 @@ class Runner:
                 #     optimizers=self.optimizers,
                 #     state=self.strategy_state,
                 # )
-
-            import pdb; pdb.set_trace()
-
             self.save_model()
             self.render_traj(self.global_step)
             torch.cuda.empty_cache()
+            import pdb; pdb.set_trace()
+
+        elif cfg.sample_from_center:
+            distance_buckets = np.arange(1.0, 13.0, 0.5)
+            last_dist = 0.0
+            num_opt_steps_per_bucket = 10_000
+
+            # added_idxs = []
+            added_idxs = idxs_of_interest
+            for bucket_idx, dist in enumerate(distance_buckets):
+                new_idxs = self.center_sample_dset.get_indices_within_range(last_dist, dist)
+                sample_idxs = self.center_sample_dset.get_indices_within_dist(dist)
+                sample_weights = self.center_sample_dset.get_weights_for_subset(sample_idxs)
+
+                if cfg.fit_pose_before_adding:
+                    for idx in new_idxs:
+                        if idx in added_idxs:
+                            # we do not need to reoptimize / update these init poses
+                            pass
+                        else:
+                            # fit cam to splat
+                            self.estimate_and_update_camera_pose(idx, iterations=50, lr=1e-3, update_viz=False, visible=False)
+
+                for idx in new_idxs:
+                    if idx in added_idxs:
+                        continue
+
+                    if bucket_idx != 0:
+                        # add points to splat
+                        data = self.trainset[idx]
+                        add_new_frame(
+                            rgb_image=data["image"].to(self.device),
+                            pcd_points=data["points_xyz"].to(self.device),
+                            pcd_rgb=data["points_rgb"].to(self.device),
+                            T_world_camera=data["camtoworld"].to(self.device),
+                            params=self.splats,
+                            optimizers=self.optimizers,
+                            state=self.strategy_state,
+                        )
+                    added_idxs.append(idx)
+
+                # update viz
+                self.add_batched_camera_frames(added_idxs, visible=True, scene_graph_name="/added_cameras")
+
+                # optimize
+                pbar = tqdm.tqdm(range(num_opt_steps_per_bucket))
+                cam_fit_iterations = [3500, 7500]
+                for iteration in pbar:
+                    self.splat_optimization(
+                        pbar, 1, sample_idxs, weights=sample_weights, update_scene_viz=False, visible=False
+                    )
+
+                    if iteration % 1000 == 0 and iteration > 0:
+                        print(f"Opacity reset")
+                        self.cfg.strategy.reset_opacity(
+                            params=self.splats,
+                            optimizers=self.optimizers,
+                            state=self.strategy_state,
+                        )
+
+                    if iteration % 3000 == 0 and iteration > 0:
+                        print(f"Removing invisible gaussians")
+                        self.remove_invisible_gaussians(added_idxs)
+
+                    if iteration in cam_fit_iterations:
+                        print(f"Re-fitting all poses")
+                        for idx in added_idxs:
+                            self.estimate_and_update_camera_pose(idx, iterations=10, lr=1e-3, update_viz=False, visible=False)
+                        self.add_batched_camera_frames(added_idxs, visible=True, scene_graph_name="/added_cameras")
+
+                # bookkeeping
+                last_dist = dist
         else:
             used_img_idxs = []
             for idx in pbar:
@@ -709,12 +799,40 @@ class Runner:
             self.render_traj(self.global_step)
             torch.cuda.empty_cache()
 
-    def add_camera_frame_frustum(self, trainset_idx):
+    def add_batched_camera_frames(self, trainset_idxs, visible=False, scene_graph_name="/batch_cameras"):
+        batched_wxyzs = []
+        batched_positions = []
+        for trainset_idx in trainset_idxs:
+            data = self.trainset[trainset_idx]
+            image_num = data['image_id'].item()
+            assert image_num == trainset_idx
+
+            T_world_cam = data["camtoworld"].numpy()
+            rot_wxyz = R.from_matrix(T_world_cam[:3, :3]).as_quat(scalar_first=True)
+            pos_xyz = T_world_cam[:3, 3]
+
+            batched_wxyzs.append(rot_wxyz)
+            batched_positions.append(pos_xyz)
+
+        batched_wxyzs = np.stack(batched_wxyzs)
+        batched_positions = np.stack(batched_positions)
+
+        self.server.scene.add_batched_axes(
+            name=scene_graph_name,
+            batched_wxyzs=batched_wxyzs,
+            batched_positions=batched_positions,
+            axes_length=0.1,
+            axes_radius=0.005,
+            visible=visible,
+        )
+
+
+    def add_camera_frame_frustum(self, trainset_idx, visible=False):
         # check if we've already added this camera frame and frustum before
-        if trainset_idx in self.cam_frame_added:
+        if trainset_idx in self.viz_cam_frame_added:
             return
 
-        self.cam_frame_added.append(trainset_idx)
+        self.viz_cam_frame_added.append(trainset_idx)
 
         data = self.trainset[trainset_idx]
         image_num = data['image_id'].item()
@@ -730,15 +848,17 @@ class Runner:
             position=pos_xyz,
             axes_length=0.1,
             axes_radius=0.005,
+            visible=visible,
         )
         self.server.scene.add_camera_frustum(
             name=f"/cameras/{str(trainset_idx).zfill(6)}/frustum",
             fov=2 * np.arctan2(self.H / 2, self.fy),
             aspect=self.W / self.H,
             scale=0.15,
+            visible=visible,
         )
 
-    def estimate_and_update_camera_pose(self, trainset_idx, iterations=50, save_imgs=False):
+    def estimate_and_update_camera_pose(self, trainset_idx, iterations=50, alpha_threshold=0.99, lr=1e-4, save_imgs=False, update_viz=False, visible=False):
         '''
         fit camera pose to the splat model, update pose in appropriate places including visualizer
         '''
@@ -758,8 +878,8 @@ class Runner:
         # estimate camera pose
         # T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(
         T_world_camEstimate, _, rgb_hat, alpha_hat = estimate_camera_pose(
-            rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=iterations, do_expo_opt=False,
-            scene=self.server.scene, scene_str=f"/cameras/{str(trainset_idx).zfill(6)}"
+            rgb_image, K, T_world_camCurrent, splats=self.splats, max_iter=iterations, do_expo_opt=False, lr=lr, alpha_threshold=alpha_threshold,
+            scene=self.server.scene if update_viz else None, scene_str=f"/cameras/{str(trainset_idx).zfill(6)}", visible=visible,
         )
 
         if save_imgs:
@@ -772,7 +892,53 @@ class Runner:
         if self.cfg.pose_opt:
             self.pose_adjust.zero_init(trainset_idx)
 
-    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None, update_scene_viz=True):
+    def remove_invisible_gaussians(self, select_idxs):
+        # figure out which gaussians are visible
+        total_visibility_mask = None
+        for idx in select_idxs:
+            data = self.trainset[idx]
+
+            camtoworlds = camtoworlds_gt = data["camtoworld"].to(self.device).unsqueeze(0)  # [1, 4, 4]
+            Ks = data["K"].to(self.device).unsqueeze(0)  # [1, 3, 3]
+            pixels = data["image"].to(self.device).unsqueeze(0) / 255.0  # [1, H, W, 3]
+            image_ids = data["image_id"].to(self.device)
+            masks = data["mask"].to(self.device).unsqueeze(0) if "mask" in data else None  # [1, H, W]
+
+            height, width = pixels.shape[1:3]
+
+            if cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+
+            sh_degree_to_use = cfg.sh_degree
+
+            # forward pass
+            _, _, info = self.rasterize_splats(
+                camtoworlds=camtoworlds,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=sh_degree_to_use,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=image_ids,
+                render_mode="RGB",
+                masks=masks,
+            )
+
+            visibility_mask = (info["radii"] > 0).any(0)
+
+            if total_visibility_mask is None:
+                total_visibility_mask = visibility_mask
+            else:
+                total_visibility_mask = torch.logical_or(total_visibility_mask, visibility_mask)
+
+        # remove the ones that are not visible
+        to_remove = torch.logical_not(total_visibility_mask)
+        remove(params=self.splats, optimizers=self.optimizers, state=self.strategy_state, mask=to_remove)
+
+        print(f"Removed {torch.sum(to_remove).item()} gaussians not visible by cameras")
+
+    def splat_optimization(self, pbar, num_steps, select_idxs, dbg=False, weights=None, update_scene_viz=False, visible=False):
         for step in range(num_steps):
             if not self.cfg.disable_viewer:
                 while self.viewer.state.status == "paused":
@@ -816,7 +982,7 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.smooth_depth_loss else "RGB", # ED = expected depth (D / alpha)
+                render_mode="RGB+ED" if (cfg.smooth_depth_loss or cfg.dvl_depth_loss) else "RGB", # ED = expected depth (D / alpha)
                 masks=masks,
             )
             if renders.shape[-1] == 4:
@@ -877,12 +1043,23 @@ class Runner:
                 )
                 loss += cfg.smooth_depth_lambda * smooth_depth_loss
 
+            if cfg.dvl_depth_loss:
+                import pdb; pdb.set_trace()
+                dvl_average_range = data["dvl_avg_range"].to(self.device)
+                average_depth = torch.mean(depths)
+                dvl_depth_loss = self.mse_loss(dvl_average_range, average_depth)
+                loss += cfg.dvl_depth_lambda * dvl_depth_loss
+
             loss.backward()
 
             # a bunch of logging
             desc = f"loss={loss.item():.3f}| " f"num gs: {len(self.splats['means'])}| " f"step={self.global_step}| "
             if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
+                desc += f"d loss={depthloss.item():.6f}| "
+            if cfg.smooth_depth_loss:
+                desc += f"smooth d loss={smooth_depth_loss.item():.6f}| "
+            if cfg.dvl_depth_loss:
+                desc += f"dvl d loss={dvl_depth_loss.item():.6f}| "
             if cfg.pose_opt:
                 # monitor the pose error
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -900,6 +1077,8 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), self.global_step)
                 if cfg.smooth_depth_loss:
                     self.writer.add_scalar("train/smoothdepthloss", smooth_depth_loss.item(), self.global_step)
+                if cfg.dvl_depth_loss:
+                    self.writer.add_scalar("train/dvldepthloss", dvl_depth_loss.item(), self.global_step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), self.global_step)
                 self.writer.add_scalar("train/mem", mem, self.global_step)
                 self.writer.add_scalar("train/time", time.time() - self.global_tic, self.global_step)
@@ -977,6 +1156,7 @@ class Runner:
                         position=pos_xyz,
                         axes_length=0.1,
                         axes_radius=0.005,
+                        visible=visible,
                     )
 
             # bookkeeping
