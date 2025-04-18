@@ -94,10 +94,12 @@ def estimate_camera_pose(
     splats: torch.nn.ParameterDict,
     do_expo_opt: bool = False,
     max_iter: int = 100,
+    lr: float =1e-4,
     dbg: bool = False,
     alpha_threshold: float = 0.0,
     scene: viser.SceneApi = None,
     scene_str: str = None,
+    visible: bool = True
 ) -> Tensor:
     # Initialize the camera optimization module with the initial guess
     cam_opt_module = CameraOptModule(1).to(device)
@@ -109,7 +111,7 @@ def estimate_camera_pose(
         expo_optimizer = torch.optim.Adam(exposure_opt_module.parameters(), lr=1e-4)
 
     # Define the optimizer
-    pose_optimizer = torch.optim.Adam(cam_opt_module.parameters(), lr=1e-4)
+    pose_optimizer = torch.optim.Adam(cam_opt_module.parameters(), lr=lr)
 
     # Define the loss function
     criterion = torch.nn.L1Loss()
@@ -177,6 +179,7 @@ def estimate_camera_pose(
                     position=pos_xyz,
                     axes_length=0.1,
                     axes_radius=0.005,
+                    visible=visible,
                 )
 
         # logging
