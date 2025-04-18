@@ -468,7 +468,7 @@ class Dataset:
 
         if self.use_dvl_data:
             avg_range, stddev_range = self.dvl_dataset.get_range_at_timestamp(ros_ts)
-            data["dvl_avg_range"] = torch.from_numpy(avg_range).float()
+            data["dvl_avg_range"] = torch.tensor(avg_range).float()
 
         if self.load_monodepths:
             subsample = 100
